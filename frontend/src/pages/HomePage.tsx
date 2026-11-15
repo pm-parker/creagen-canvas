@@ -333,8 +333,11 @@ export function HomePage() {
   });
   const featured = useMemo(() => featuredModels(channels.data?.channels ?? []), [channels.data]);
   const weeklyCount = useMemo(
-    () => (tasks.data && projects.data ? countThisWeek(tasks.data.tasks.map((t) => t.created_at), new Date()) : null),
-    [tasks.data, projects.data],
+    () =>
+      tasks.data && projects.data && tasks.dataUpdatedAt
+        ? countThisWeek(tasks.data.tasks.map((t) => t.created_at), new Date(tasks.dataUpdatedAt))
+        : null,
+    [tasks.data, tasks.dataUpdatedAt, projects.data],
   );
   const changelog = useMemo(() => parseChangelog(changelogRaw, 3), []);
 
