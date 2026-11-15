@@ -18,6 +18,10 @@ import { PromptsPage } from "@/pages/PromptsPage";
 import { TasksPage } from "@/pages/TasksPage";
 import { CostsPage } from "@/pages/CostsPage";
 import { AssetsPage } from "@/pages/AssetsPage";
+import { StoryboardsPage, StoryboardDetailPage } from "@/pages/storyboard/StoryboardPages";
+import { CharactersPage } from "@/pages/CharactersPage";
+import { SettingsPage } from "@/pages/SettingsPage";
+import { SharePage } from "@/pages/SharePage";
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
@@ -58,13 +62,18 @@ const router = createBrowserRouter([
           { path: "/prompts", element: <PromptsPage /> },
           { path: "/tasks", element: <TasksPage /> },
           { path: "/projects", element: <ProjectsPage /> },
-      { path: "/costs", element: <CostsPage /> },
-      { path: "/assets", element: <AssetsPage /> },
+          { path: "/costs", element: <CostsPage /> },
+          { path: "/assets", element: <AssetsPage /> },
           { path: "/canvas/:projectId", element: <CanvasPage /> },
+          { path: "/storyboards", element: <StoryboardsPage /> },
+          { path: "/storyboards/:id", element: <StoryboardDetailPage /> },
+          { path: "/characters", element: <CharactersPage /> },
+          { path: "/settings", element: <SettingsPage /> },
           { path: "/settings/channels", element: <ChannelsPage /> },
           { path: "*", element: <NotFoundPage /> },
         ],
       },
+      { path: "/share/:token", element: <SharePage /> },
     ],
   },
 ]);
