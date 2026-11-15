@@ -1,0 +1,106 @@
+[project]
+name = "creagen-canvas"
+version = "0.10.0"
+description = "自托管的 AI 创作画布：多用户、自带任务队列与成本治理，生图/视频/LLM 渠道开箱可配"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+dependencies = [
+    "alembic>=1.20.0",
+    "arq>=0.26",
+    "bcrypt>=5.0.0",
+    "cryptography>=50.0.1",
+    "fastapi>=0.115",
+    "httpx>=0.28.1",
+    "psycopg[binary]>=3.3.6",
+    "pydantic-settings>=2.15.0",
+    "python-jose[cryptography]>=3.5.0",
+    "sqlalchemy>=2.0",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["alembic/versions"]  # autogenerate 产物不格式化
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC"]
+ignore = ["B008", "ASYNC240"]  # B008=FastAPI Depends 惯例; ASYNC240=async 内同步 mkdir（短操作可接受）
+
+[tool.ruff.lint.per-file-ignores]
+# 内置提示词种子库：长文本内容天然超行宽
+"backend/app/seed_prompts.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+check_untyped_defs = true
+warn_unused_ignores = true
+no_implicit_optional = true
+
+[[tool.mypy.overrides]]
+module = "backend.app.core.*"
+disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+# 旧式 declarative（照搬生产形态，cherry-pick 回流友好）下 ORM 属性被推断为
+# Column[...]；以下直接读写 ORM 属性的模块关闭这两类假阳性
+module = [
+    "backend.app.routers.agent",
+    "backend.app.routers.agent_runs",
+    "backend.app.routers.auth",
+    "backend.app.routers.manifest",
+    "backend.app.services.agent_brain",
+    "backend.app.services.agent_orchestrator",
+    "backend.app.services.agent_run_store",
+    "backend.app.services.agent_tools",
+    "backend.app.services.manifest_service",
+    "backend.app.services.param_schema",
+    "backend.app.services.vision_reverse",
+    "backend.tests.*",
+    "backend.app.models.*",
+    "backend.app.services.task_store",
+    "backend.app.services.task_lifecycle",
+    "backend.app.services.storyboard_orchestrator",
+    "backend.app.services.llm_budget",
+    "backend.app.services.rate_limiter",
+    "backend.app.routers.tasks",
+    "backend.app.routers.providers",
+    "backend.app.routers.storyboard",
+    "backend.app.routers.costs",
+    "backend.app.routers.snapshots",
+    "backend.app.routers.openai_api",
+    "backend.app.routers.canvas",
+    "backend.app.routers.characters",
+    "backend.app.routers.templates",
+    "backend.app.models.character",
+    "backend.app.models.template",
+    "backend.app.models.canvas",
+    "backend.app.routers.prompts",
+    "backend.app.routers.assets",
+    "backend.app.routers.settings",
+    "backend.app.services.provider_service",
+    "backend.worker",
+]
+disable_error_code = ["assignment", "arg-type", "union-attr", "return-value", "dict-item", "var-annotated", "index", "list-item", "misc"]
+
+[[tool.mypy.overrides]]
+module = ["tests.*", "backend.tests.*"]
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+pythonpath = [".", "backend"]
+testpaths = ["backend/tests"]
+# 本地默认跳过需真实 PG/Redis 的集成用例；CI 集成任务用 -m integration 显式执行
+addopts = '-m "not integration"'
+markers = [
+    "integration: 需要真实 PG/Redis 容器的集成测试",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "respx>=0.23.1",
+    "ruff>=0.16.9",
+    "types-python-jose>=3.5.0.20260408",
+]

@@ -1,0 +1,140 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: creagen
+      POSTGRES_PASSWORD: creagen
+      POSTGRES_DB: creagen
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U creagen -d creagen"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    volumes:
+      - ./backend:/app/backend
+      - ./alembic:/app/alembic
+      - ./deploy/static-prebuilt:/app/static
+    entrypoint: ["sh", "-c", "alembic upgrade head"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://creagen:creagen@db:5432/creagen
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      REDIS_URL: redis://redis:6379/0
+      COMFYUI_WATCH_URLS: ${COMFYUI_WATCH_URLS:-}
+      JWT_SECRET: ${JWT_SECRET:?请在 .env 设置 JWT_SECRET}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?请在 .env 设置 ENCRYPTION_KEY}
+      REGISTER_MODE: ${REGISTER_MODE:-invite}
+      INVITE_CODES: ${INVITE_CODES:-letmein}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8080}:8080"
+    environment:
+      DATABASE_URL: postgresql+psycopg://creagen:creagen@db:5432/creagen
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      REDIS_URL: redis://redis:6379/0
+      COMFYUI_WATCH_URLS: ${COMFYUI_WATCH_URLS:-}
+      JWT_SECRET: ${JWT_SECRET}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      REGISTER_MODE: ${REGISTER_MODE:-invite}
+      INVITE_CODES: ${INVITE_CODES:-letmein}
+      ENABLE_FAKE_PROVIDER: ${ENABLE_FAKE_PROVIDER:-false}
+    volumes:
+      - ./outputs:/app/outputs
+      - ./backend:/app/backend
+      - ./alembic:/app/alembic
+      - ./deploy/static-prebuilt:/app/static
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    restart: unless-stopped
+    command: arq backend.worker.WorkerSettings
+    volumes:
+      - ./outputs:/app/outputs
+      - ./backend:/app/backend
+      - ./alembic:/app/alembic
+    environment:
+      DATABASE_URL: postgresql+psycopg://creagen:creagen@db:5432/creagen
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      REDIS_URL: redis://redis:6379/0
+      COMFYUI_WATCH_URLS: ${COMFYUI_WATCH_URLS:-}
+      JWT_SECRET: ${JWT_SECRET}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      REGISTER_MODE: ${REGISTER_MODE:-invite}
+      INVITE_CODES: ${INVITE_CODES:-letmein}
+      ENABLE_FAKE_PROVIDER: ${ENABLE_FAKE_PROVIDER:-false}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+  worker-video:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    restart: unless-stopped
+    command: arq backend.worker.WorkerSettings
+    volumes:
+      - ./outputs:/app/outputs
+      - ./backend:/app/backend
+      - ./alembic:/app/alembic
+    environment:
+      DATABASE_URL: postgresql+psycopg://creagen:creagen@db:5432/creagen
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      REDIS_URL: redis://redis:6379/0
+      COMFYUI_WATCH_URLS: ${COMFYUI_WATCH_URLS:-}
+      JWT_SECRET: ${JWT_SECRET}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      REGISTER_MODE: ${REGISTER_MODE:-invite}
+      INVITE_CODES: ${INVITE_CODES:-letmein}
+      ENABLE_FAKE_PROVIDER: ${ENABLE_FAKE_PROVIDER:-false}
+      WORKER_QUEUE: video
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    container_name: creagen-canvas-worker-video-1
+
+
+volumes:
+  pgdata:

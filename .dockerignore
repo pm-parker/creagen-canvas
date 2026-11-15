@@ -1,0 +1,17 @@
+.git
+.venv
+__pycache__
+*.pyc
+.mypy_cache
+.ruff_cache
+.pytest_cache
+.superpowers
+node_modules
+frontend/dist
+*.db
+outputs
+docs
+scripts
+.github
+frontend/node_modules/
+frontend/dist/

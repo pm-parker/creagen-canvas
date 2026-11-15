@@ -1,0 +1,36 @@
+CreaGen Canvas
+Copyright (c) 2026 creagen-canvas contributors
+
+CreaGen Canvas is distributed under the MIT License. The complete license
+text is provided in LICENSE.
+
+Project scope
+-------------
+
+CreaGen Canvas is a self-hosted, multi-user AI creation canvas: node-based
+generation workflows for image / video / LLM / audio with built-in durable
+task queues, cost governance, and UI-configurable model provider channels.
+
+Upstream inspiration
+--------------------
+
+This project is an independent implementation. Its canvas interaction
+design draws inspiration from the following MIT-licensed projects (no code
+copied):
+
+- basketikun/infinite-canvas — https://github.com/basketikun/infinite-canvas
+- glanderness/BeefTV — https://github.com/glanderness/BeefTV
+
+Prior internal lineage
+----------------------
+
+Parts of the backend (task queue, cost governance, auth) are derived from
+the authors' own private CreaGen production codebase and re-licensed here
+under MIT.
+
+Third-party software and assets
+-------------------------------
+
+Dependencies remain subject to the licenses of their respective authors.
+See THIRD_PARTY_NOTICES.md for the audited dependency inventory distributed
+with public snapshots.

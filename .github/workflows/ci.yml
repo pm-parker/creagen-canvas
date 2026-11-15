@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: |
+          uv venv
+          uv pip install \
+            "fastapi>=0.115" "uvicorn[standard]>=0.30" "httpx>=0.27" "arq>=0.26" \
+            "alembic>=1.13" "python-jose[cryptography]>=3.3" "bcrypt" \
+            "python-multipart>=0.0.9" "psycopg[binary]>=3.2" "redis>=5.0" \
+            "sqlalchemy>=2.0" "pillow>=12.2" "pydantic-settings" "cryptography" \
+            pytest "types-python-jose" ruff mypy
+
+      - name: Lint (ruff)
+        run: uv run ruff check .
+
+      - name: Type check (mypy)
+        run: uv run mypy backend
+
+      - name: Unit tests
+        run: uv run pytest -q -m "not integration"
+
+      - name: Integration tests (Redis + PG services)
+        run: uv run pytest -q -m integration
+        env:
+          DATABASE_URL: postgresql+psycopg://creagen:creagen@localhost:5432/creagen
+          REDIS_URL: redis://localhost:6379/0
+          JWT_SECRET: ci-jwt-secret-0123456789abcdef
+          ENCRYPTION_KEY: ci-encryption-key-0123456789abcdef
+          REGISTER_MODE: open
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: creagen
+          POSTGRES_PASSWORD: creagen
+          POSTGRES_DB: creagen
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U creagen"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 10
