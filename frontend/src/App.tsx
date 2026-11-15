@@ -4,6 +4,8 @@ import { createBrowserRouter, Outlet, useNavigate } from "react-router";
 import { RouterProvider } from "react-router/dom";
 import { NotFoundPage } from "./pages/NotFoundPage";
 import { setUnauthorizedHandler } from "@/lib/api";
+import { AppErrorBoundary } from "@/components/AppErrorBoundary";
+import { RunNoticeToasts } from "@/components/RunNoticeToasts";
 import { RequireAuth } from "@/components/RequireAuth";
 import { LoginPage } from "@/pages/auth/LoginPage";
 import { RegisterPage } from "@/pages/auth/RegisterPage";
@@ -40,6 +42,7 @@ const router = createBrowserRouter([
     element: (
       <>
         <UnauthorizedBridge />
+        <RunNoticeToasts />
         <Outlet />
       </>
     ),
@@ -69,7 +72,9 @@ const router = createBrowserRouter([
 export default function App() {
   return (
     <QueryClientProvider client={queryClient}>
-      <RouterProvider router={router} />
+      <AppErrorBoundary>
+        <RouterProvider router={router} />
+      </AppErrorBoundary>
     </QueryClientProvider>
   );
 }
