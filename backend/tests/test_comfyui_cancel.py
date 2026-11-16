@@ -150,7 +150,7 @@ def shim(monkeypatch):
 
     monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
 
-    mod._test_calls = calls  # type: ignore[attr-defined]  # 测试注入，shim 模块无此属性声明
+    mod._test_calls = calls  # 测试注入，shim 模块无此属性声明
 
     return mod
 

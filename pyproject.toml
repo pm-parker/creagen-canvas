@@ -1,6 +1,6 @@
 [project]
 name = "creagen-canvas"
-version = "0.10.0"
+version = "0.15.0"
 description = "自托管的 AI 创作画布：多用户、自带任务队列与成本治理，生图/视频/LLM 渠道开箱可配"
 requires-python = ">=3.12"
 license = { file = "LICENSE" }
@@ -11,9 +11,12 @@ dependencies = [
     "cryptography>=50.0.1",
     "fastapi>=0.115",
     "httpx>=0.28.1",
+    "pillow>=12.2",
     "psycopg[binary]>=3.3.6",
     "pydantic-settings>=2.15.0",
     "python-jose[cryptography]>=3.5.0",
+    "python-multipart>=0.0.9",
+    "redis>=5.0",
     "sqlalchemy>=2.0",
     "uvicorn[standard]>=0.54.0",
 ]

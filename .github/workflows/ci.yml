@@ -20,14 +20,7 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: |
-          uv venv
-          uv pip install \
-            "fastapi>=0.115" "uvicorn[standard]>=0.30" "httpx>=0.27" "arq>=0.26" \
-            "alembic>=1.13" "python-jose[cryptography]>=3.3" "bcrypt" \
-            "python-multipart>=0.0.9" "psycopg[binary]>=3.2" "redis>=5.0" \
-            "sqlalchemy>=2.0" "pillow>=12.2" "pydantic-settings" "cryptography" \
-            pytest "types-python-jose" ruff mypy
+        run: uv sync --frozen --python 3.12
 
       - name: Lint (ruff)
         run: uv run ruff check .
@@ -66,3 +59,36 @@ jobs:
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 5s --health-timeout 3s --health-retries 10
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck (tsc)
+        run: pnpm exec tsc -b --noEmit
+
+      - name: Lint (oxlint)
+        run: pnpm lint
+
+      - name: Unit tests (vitest)
+        run: npx vitest run
+
+      - name: Build
+        run: pnpm build
