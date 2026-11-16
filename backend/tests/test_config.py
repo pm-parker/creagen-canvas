@@ -24,6 +24,22 @@ def test_missing_required_var_fails_fast(monkeypatch):
         assert "JWT_SECRET" in str(e)
 
 
+def test_validation_error_does_not_leak_secret(monkeypatch):
+    """round 3：hide_input_in_errors=True —— 过短密钥的 ValidationError 不得回显密钥本身。"""
+    from pydantic import ValidationError
+
+    leaked = "leaky-s3cret"
+    assert len(leaked) < 16
+    monkeypatch.setenv("JWT_SECRET", leaked)
+    monkeypatch.setenv("ENCRYPTION_KEY", "e" * 64)
+    monkeypatch.chdir("/tmp")
+
+    with pytest.raises(ValidationError, match="JWT_SECRET") as ei:
+        _make_settings()
+    assert leaked not in str(ei.value)
+    assert leaked not in repr(ei.value)
+
+
 def test_defaults_and_parsing(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://x:y@localhost/z")
     monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")

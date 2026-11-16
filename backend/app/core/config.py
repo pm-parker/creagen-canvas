@@ -45,6 +45,8 @@ def _is_placeholder_secret(value: str) -> bool:
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
+        # 校验错误的 repr 不回显密钥本身（round 3：防日志/CI 泄露）
+        hide_input_in_errors=True,
         env_file_encoding="utf-8",
         extra="ignore",
     )
