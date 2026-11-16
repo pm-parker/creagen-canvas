@@ -5,6 +5,10 @@
 - 锁定形同虚设：暴力破解可继续验证猜测。
 修复后：验密码前先只读预检（is_limited，不消耗额度），锁定期内一律 429；
 成功登录不计数并清空该用户失败计数。
+
+审查轮补充：预检只看用户名桶——IP 桶若参与预检，反代共享 IP 下攻击者
+刷满 30 次失败即可让所有用户（含正确密码）永久 429，构成横向拒绝服务。
+IP 桶只允许把“已失败”的尝试从 401 升级为 429，绝不得拦截正确密码。
 """
 
 import time
@@ -125,6 +129,36 @@ def test_memory_mode_lock_expires_after_window(client, monkeypatch):
 
     r = _login(client, "alice", PASSWORD)
     assert r.status_code == 200, r.text
+
+
+def test_ip_limit_never_blocks_correct_password(client):
+    """IP 桶刷爆（30 次失败）后，同 IP 其他用户的正确密码仍必须 200。
+
+    反代场景回归：全体用户共享 request.client.host，攻击者一人失败 30 次
+    不应连累正常用户登录（预检只看用户名桶）。
+    """
+    _register(client)
+    client.post(
+        "/api/auth/register",
+        json={
+            "username": "bob",
+            "email": "bob@example.com",
+            "password": PASSWORD,
+            "invite_code": "letmein",
+        },
+    )
+    # 攻击者对不存在用户连错 30 次：每张卡的 per-id 桶只 +1，IP 桶 +30
+    for i in range(30):
+        assert _login(client, f"ghost{i}", WRONG).status_code == 401
+    # IP 桶已超限，但 bob 密码正确：不得被预检拦截
+    r = _login(client, "bob", PASSWORD)
+    assert r.status_code == 200, r.text
+    # 同 IP 再失败一次：IP 桶直接给 429（只影响错误密码）
+    r = _login(client, "ghost30", WRONG)
+    assert r.status_code == 429, r.text
+    assert r.json()["detail"]["code"] == "RATE_LIMITED"
+    # 429 之后 bob 的正确密码依旧畅通
+    assert _login(client, "bob", PASSWORD).status_code == 200
 
 
 def test_lockout_stops_bruteforce_not_oracle(client):

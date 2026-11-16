@@ -69,9 +69,11 @@ def login(
 ) -> TokenResponse:
     """登录：按用户名与来源 IP 双桶限流（N2 防暴力破解）。
 
-    P2 安全：验密码前先检查双桶是否已超限（只读预检，不消耗额度）——
-    锁定期内即使密码正确也 429，既不泄露“这次猜对没有”，也真正阻断暴力破解；
-    成功登录不计数并清空失败计数。
+    P2 安全：验密码前先只读预检“用户名桶”是否已超限（不消耗额度）——
+    锁定期内即使密码正确也 429，既不泄露“这次猜对没有”，也真正阻断暴力破解。
+    IP 桶只对“已失败”的尝试生效（错密码时 429 替代 401），绝不拦截正确密码：
+    反代聚合 IP 下，攻击者的失败不应连累同 IP 其他用户正常登录。
+    成功登录不计数并清空该用户名失败计数。
     """
     from backend.app.services.rate_limiter import RateLimitExceeded, enforce, is_limited
     from backend.app.services.rate_limiter import clear as clear_limit
@@ -79,10 +81,12 @@ def login(
     ip = request.client.host if request.client else "unknown"
 
     def _locked_out() -> HTTPException | None:
-        """只读预检：任一桶已超限则返回 429（不消耗额度）。"""
+        """只读预检：仅查用户名桶（不消耗额度、不看 IP 桶）。
+
+        IP 桶不得进入预检：预检在验密码之前，若它参与判定，攻击者刷爆共享 IP
+        桶即可让所有用户（含正确密码）一律 429，构成拒绝服务。
+        """
         wait = is_limited("auth", f"login:id:{body.identifier}", limit=10)
-        if wait is None:
-            wait = is_limited("auth", f"login:ip:{ip}", limit=30)
         if wait is not None:
             return HTTPException(
                 status_code=429,
@@ -94,32 +98,30 @@ def login(
             )
         return None
 
-    def _count_fail() -> None:
-        """失败计数（超过任一桶即 429）——只计失败，成功登录互不影响。"""
-        try:
-            enforce(
-                "auth",
-                f"login:id:{body.identifier}",
-                limit=10,
-                window_seconds=300,
-                message="尝试过于频繁，请 5 分钟后再试",
-            )
-            enforce(
-                "auth",
-                f"login:ip:{ip}",
-                limit=30,
-                window_seconds=300,
-                message="该来源尝试过于频繁，请稍后再试",
-            )
-        except RateLimitExceeded as e:
-            raise HTTPException(
-                status_code=429,
-                detail={
-                    "code": "RATE_LIMITED",
-                    "message": str(e),
-                    "hint": f"请 {e.wait_seconds}s 后重试",
-                },
-            ) from e
+    def _count_fail() -> HTTPException | None:
+        """失败计数：两桶各 +1；任一桶超限则返回 429（仅作用于失败尝试）。
+
+        两桶都先计数再判断，避免第一个桶抛出导致第二个桶漏计；
+        返回 429 替代 401，只发生在密码已错的前提下——正确密码永不被 IP 桶拦截。
+        """
+        limited: HTTPException | None = None
+        for key, limit, message in (
+            (f"login:id:{body.identifier}", 10, "尝试过于频繁，请 5 分钟后再试"),
+            (f"login:ip:{ip}", 30, "该来源尝试过于频繁，请稍后再试"),
+        ):
+            try:
+                enforce("auth", key, limit=limit, window_seconds=300, message=message)
+            except RateLimitExceeded as e:
+                if limited is None:
+                    limited = HTTPException(
+                        status_code=429,
+                        detail={
+                            "code": "RATE_LIMITED",
+                            "message": str(e),
+                            "hint": f"请 {e.wait_seconds}s 后重试",
+                        },
+                    )
+        return limited
 
     # 锁定期内不验密码，直接 429：不泄露密码正确性，也不给重试机会
     locked = _locked_out()
@@ -129,7 +131,10 @@ def login(
     try:
         user = authenticate(db, body.identifier, body.password)
     except AuthError as e:
-        _count_fail()
+        # 失败才计数；IP 桶超限时以 429 替代 401（密码已错，无泄露风险）
+        limited = _count_fail()
+        if limited is not None:
+            raise limited from e
         raise HTTPException(
             status_code=e.status_code, detail={"code": e.code, "message": e.message}
         ) from e
