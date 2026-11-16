@@ -3,15 +3,20 @@
 derived from creagen prod app/config.py @ 2026-09-27，重写为 Settings 模式。
 """
 
+import logging
 from functools import lru_cache
 
 from pydantic import Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# 安全密钥最低长度（openssl rand -hex 32 生成 64 字符，32 是下限）
-SECRET_MIN_LENGTH = 32
-# .env.example / 部署文档中出现的占位值特征（不区分大小写）：命中即拒绝启动，
-# 防止示例配置被原样复制上线。特征取子串匹配，覆盖 change-me / your-secret 等变体。
+logger = logging.getLogger("creagen.config")
+
+# 安全密钥最低长度（保持原 16 下限：小于 16 启动报错；>=32 的随机值才是推荐强度）
+SECRET_MIN_LENGTH = 16
+# 推荐长度：openssl rand -hex 32 生成 64 字符；低于它只告警不拦截（存量部署兼容）
+SECRET_RECOMMENDED_LENGTH = 32
+# .env.example / 部署文档中出现的占位值特征（不区分大小写）：命中不再拒绝启动，
+# 仅输出 WARNING（round 2 放宽：存量部署兼容）。子串匹配覆盖 change-me 等变体。
 _SECRET_PLACEHOLDER_MARKERS = (
     "change-me",
     "change_me",
@@ -69,11 +74,12 @@ class Settings(BaseSettings):
 
     @field_validator("jwt_secret", "encryption_key")
     @classmethod
-    def _reject_weak_secret(cls, v: str, info: ValidationInfo) -> str:
-        """启动即拒绝空/过短/占位密钥（部署脚手架 footgun 封堵）。
+    def _check_secret(cls, v: str, info: ValidationInfo) -> str:
+        """密钥校验：<16 直接拒绝；偏短/占位值只告警（存量部署兼容，round 2 决定）。
 
-        - 长度 < SECRET_MIN_LENGTH：熵不足；
-        - 命中占位特征：.env.example 等示例值被原样复制上线。
+        - 长度 < SECRET_MIN_LENGTH：熵不足，启动即报错；
+        - 长度 16~31 或命中占位特征：不拦截，仅 WARNING 提示换强随机值。
+        消息里绝不输出密钥本身。
         """
         env_name = _FIELD_TO_ENV.get(info.field_name or "", info.field_name or "?")
         stripped = v.strip()
@@ -82,10 +88,20 @@ class Settings(BaseSettings):
                 f"{env_name} 不安全：至少 {SECRET_MIN_LENGTH} 字符（当前 {len(stripped)}）。"
                 "请生成随机值：openssl rand -hex 32"
             )
+        reasons: list[str] = []
+        if len(stripped) < SECRET_RECOMMENDED_LENGTH:
+            reasons.append(f"长度仅 {len(stripped)}（建议 >= {SECRET_RECOMMENDED_LENGTH}）")
         if _is_placeholder_secret(stripped):
-            raise ValueError(
-                f"{env_name} 不安全：仍为示例占位值（检测到 change-me/please-change 等特征）。"
-                "请生成随机值：openssl rand -hex 32"
+            reasons.append("仍为示例占位值（检测到 change-me/please-change 等特征）")
+        if reasons:
+            extra = (
+                "；注意：轮换该值会使已保存的渠道密钥无法解密，请先导出备份"
+                if env_name == "ENCRYPTION_KEY"
+                else ""
+            )
+            logger.warning(
+                "%s 强度偏弱（%s），存在被猜解/示例值复用的风险。"
+                "建议生成随机值替换：openssl rand -hex 32%s。", env_name, "；".join(reasons), extra
             )
         return v
 
