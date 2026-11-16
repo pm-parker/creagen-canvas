@@ -67,24 +67,46 @@ def login(
     request: Request,
     db: Session = Depends(get_db),
 ) -> TokenResponse:
-    """登录：按用户名与来源 IP 双桶限流（N2 防暴力破解；失败也计数）。"""
-    from backend.app.services.rate_limiter import RateLimitExceeded, enforce
+    """登录：按用户名与来源 IP 双桶限流（N2 防暴力破解）。
+
+    P2 安全：验密码前先检查双桶是否已超限（只读预检，不消耗额度）——
+    锁定期内即使密码正确也 429，既不泄露“这次猜对没有”，也真正阻断暴力破解；
+    成功登录不计数并清空失败计数。
+    """
+    from backend.app.services.rate_limiter import RateLimitExceeded, enforce, is_limited
+    from backend.app.services.rate_limiter import clear as clear_limit
 
     ip = request.client.host if request.client else "unknown"
+
+    def _locked_out() -> HTTPException | None:
+        """只读预检：任一桶已超限则返回 429（不消耗额度）。"""
+        wait = is_limited("auth", f"login:id:{body.identifier}", limit=10)
+        if wait is None:
+            wait = is_limited("auth", f"login:ip:{ip}", limit=30)
+        if wait is not None:
+            return HTTPException(
+                status_code=429,
+                detail={
+                    "code": "RATE_LIMITED",
+                    "message": "尝试过于频繁，请 5 分钟后再试",
+                    "hint": f"请 {wait}s 后重试",
+                },
+            )
+        return None
 
     def _count_fail() -> None:
         """失败计数（超过任一桶即 429）——只计失败，成功登录互不影响。"""
         try:
             enforce(
-                f"login:id:{body.identifier}",
                 "auth",
+                f"login:id:{body.identifier}",
                 limit=10,
                 window_seconds=300,
                 message="尝试过于频繁，请 5 分钟后再试",
             )
             enforce(
-                f"login:ip:{ip}",
                 "auth",
+                f"login:ip:{ip}",
                 limit=30,
                 window_seconds=300,
                 message="该来源尝试过于频繁，请稍后再试",
@@ -99,6 +121,11 @@ def login(
                 },
             ) from e
 
+    # 锁定期内不验密码，直接 429：不泄露密码正确性，也不给重试机会
+    locked = _locked_out()
+    if locked is not None:
+        raise locked
+
     try:
         user = authenticate(db, body.identifier, body.password)
     except AuthError as e:
@@ -107,8 +134,6 @@ def login(
             status_code=e.status_code, detail={"code": e.code, "message": e.message}
         ) from e
     # 成功：清失败计数
-    from backend.app.services.rate_limiter import clear as clear_limit
-
     clear_limit("auth", f"login:id:{body.identifier}")
     return TokenResponse(access_token=create_access_token(user))
 

@@ -56,6 +56,35 @@ def clear(scope: str, key: str) -> None:
         _memory_store.pop(k, None)
 
 
+def is_limited(scope: str, key: str, limit: int) -> int | None:
+    """只读预检：计数已达 limit（>=）则视为锁定，返回剩余等待秒；未锁定返回 None。
+
+    不 +1、不续期（与 consume 不同），用于“先查后做”场景（如登录验密码前
+    判断是否已锁定）：命中与否都不消耗额度。Redis 不可达时回落内存计数。
+    """
+    k = _key(scope, key)
+    try:
+        raw = get_sync_redis().get(k)
+        count = int(raw) if raw is not None else 0
+    except Exception:  # noqa: BLE001 — Redis 故障时退化为内存判断
+        count, expires_at = _memory_store.get(k, (0, 0.0))
+        if count < limit:
+            return None
+        if expires_at <= time.time():
+            # 窗口已过期：视同未锁定，并顺手清掉陈旧条目。
+            # 否则内存模式下计数永不过期，登录会被永久锁死
+            # （login() 锁定期内不再 _count_fail，计数无机会被重置）。
+            _memory_store.pop(k, None)
+            return None
+        return max(0, int(expires_at - time.time()))
+    if count < limit:
+        return None
+    try:
+        return max(0, int(get_sync_redis().ttl(k)))
+    except Exception:  # noqa: BLE001 — TTL 不可读时按 0s 提示
+        return 0
+
+
 def enforce(scope: str, key: str, limit: int, window_seconds: int, message: str) -> None:
     count, ttl = consume(scope, key, limit, window_seconds)
     if count > limit:
