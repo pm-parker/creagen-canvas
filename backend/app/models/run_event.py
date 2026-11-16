@@ -4,7 +4,17 @@
 derived from creagen prod design 2026-10-10 agent-run-v2-tech-design.md §3。
 """
 
-from sqlalchemy import BigInteger, Column, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    func,
+)
 
 from backend.app.models.base import Base
 
@@ -31,10 +41,12 @@ RUN_EVENT_TYPES = (
 class RunEvent(Base):
     __tablename__ = "run_events"
 
+    # 事件流按 (run_id, id) 有序读（SSE 补发/游标），复合索引即为此设计；
+    # 建表迁移 f8a9b0c1d2e3 建的就是它，这里显式声明避免模型/迁移漂移。
+    __table_args__ = (Index("ix_run_events_run", "run_id", "id"),)
+
     id = Column(_EVENT_ID_TYPE, primary_key=True, autoincrement=True)  # 全局单调=SSE 补发游标
-    run_id = Column(
-        Integer, ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False, index=True
-    )
+    run_id = Column(Integer, ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False)
     type = Column(String(40), nullable=False)
     parent_id = Column(BigInteger, nullable=True)  # 树形预留（steering/分支）
     payload_json = Column(Text, nullable=False, default="{}")

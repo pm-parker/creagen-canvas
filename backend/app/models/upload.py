@@ -21,7 +21,7 @@ class UploadRecord(Base):
     mime = Column(String(100), nullable=False)
     size_bytes = Column(Integer, nullable=False)
 
-    created_at = Column(DateTime, default=func.now())
+    created_at = Column(DateTime, nullable=False, default=func.now())
 
     def to_dict(self) -> dict:
         return {
