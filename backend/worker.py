@@ -586,12 +586,10 @@ async def _cleanup_stale_tasks() -> None:
         db.rollback()
         logger.exception("cleanup_stale_tasks failed")
     # queued 收尸：入队后长时间无人接手（队列/worker 崩溃遗留）——同样条件 UPDATE 防竞态。
-    # 用 created_at（排队起点）而非 started_at（从未开始），且阈值独立且更大
-    # （queued 生命周期含排队预算，见 core/timeouts.py CLEANUP_STALE_QUEUED_MIN）。
+    # 用 created_at（排队起点）而非 started_at（从未开始），且阈值独立且更大、可配置
+    # （queued 生命周期含排队预算，默认 QUEUED_TASK_TIMEOUT_MIN=90，见 core/config.py）。
     try:
-        from backend.app.core.timeouts import CLEANUP_STALE_QUEUED_MIN
-
-        cutoff_q = datetime.utcnow() - timedelta(minutes=CLEANUP_STALE_QUEUED_MIN)
+        cutoff_q = datetime.utcnow() - timedelta(minutes=get_settings().queued_task_timeout_min)
         stale_q = (
             db.query(Task)
             .filter(

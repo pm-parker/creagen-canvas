@@ -204,12 +204,13 @@ def test_stale_queued_task_reaped_but_fresh_kept(client, worker_db, db_session):
     """queued 超时（created_at 旧）被标记 failed；新鲜的 queued 不受影响。"""
     from datetime import datetime, timedelta
 
-    from backend.app.core.timeouts import CLEANUP_STALE_QUEUED_MIN
+    from backend.app.core.config import get_settings
     from backend.app.models import Task
     from backend.worker import run_maintenance_job
 
+    timeout_min = get_settings().queued_task_timeout_min
     old = Task(user_id=1, type="image", prompt="old", model="fake-image", status="queued")
-    old.created_at = datetime.utcnow() - timedelta(minutes=CLEANUP_STALE_QUEUED_MIN + 10)
+    old.created_at = datetime.utcnow() - timedelta(minutes=timeout_min + 10)
     fresh = Task(user_id=1, type="image", prompt="fresh", model="fake-image", status="queued")
     db_session.add_all([old, fresh])
     db_session.commit()
@@ -223,6 +224,55 @@ def test_stale_queued_task_reaped_but_fresh_kept(client, worker_db, db_session):
     assert old_task.status == "failed", "超时 queued 任务必须被收尸"
     assert "排队" in (old_task.error_msg or ""), old_task.error_msg
     assert fresh_task.status == "queued", "新鲜 queued 任务不得被误杀"
+
+
+def test_stale_queued_reaper_timeout_is_configurable(client, worker_db, db_session):
+    """QUEUED_TASK_TIMEOUT_MIN 可配：调小后仅略超新阈值的 queued 任务即被收尸。
+
+    默认 90 分钟时 10 分钟前的 queued 不该被收；把配置调成 5 分钟后同一任务被收尸，
+    证明 reaper 的 cutoff 确实跟随配置（不是硬编码常量）。
+    """
+    from datetime import datetime, timedelta
+
+    from backend.app.core.config import get_settings
+    from backend.app.models import Task
+    from backend.worker import run_maintenance_job
+
+    settings = get_settings()
+    default_timeout = settings.queued_task_timeout_min
+    assert default_timeout == 90, "默认阈值必须保持 90"
+
+    # 覆盖配置：阈值收到 5 分钟
+    object.__setattr__(settings, "queued_task_timeout_min", 5)
+
+    mid = Task(user_id=1, type="image", prompt="mid", model="fake-image", status="queued")
+    mid.created_at = datetime.utcnow() - timedelta(minutes=10)  # < 默认 90：默认不收尸
+    db_session.add(mid)
+    db_session.commit()
+    mid_id = int(mid.id)
+
+    try:
+        asyncio.run(run_maintenance_job({}, "cleanup_stale_tasks", None))
+    finally:
+        object.__setattr__(settings, "queued_task_timeout_min", default_timeout)
+
+    db_session.expire_all()
+    t = db_session.get(Task, mid_id)
+    assert t.status == "failed", "调小阈值后，10 分钟前的 queued 任务应被收尸"
+    assert "排队" in (t.error_msg or ""), t.error_msg
+
+    # 反向：恢复默认阈值（90）后，同样 10 分钟前的任务不再被收尸
+    other = Task(user_id=1, type="image", prompt="other", model="fake-image", status="queued")
+    other.created_at = datetime.utcnow() - timedelta(minutes=10)
+    db_session.add(other)
+    db_session.commit()
+    other_id = int(other.id)
+
+    asyncio.run(run_maintenance_job({}, "cleanup_stale_tasks", None))
+
+    db_session.expire_all()
+    t2 = db_session.get(Task, other_id)
+    assert t2.status == "queued", "默认阈值下 10 分钟前的 queued 不该被收尸"
 
 
 # ---- 4) review 竞态修复：认领守卫 + 终态写保护 ------------------------------
