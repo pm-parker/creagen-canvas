@@ -229,8 +229,8 @@ def test_stale_queued_task_reaped_but_fresh_kept(client, worker_db, db_session):
 def test_stale_queued_reaper_timeout_is_configurable(client, worker_db, db_session):
     """QUEUED_TASK_TIMEOUT_MIN 可配：调小后仅略超新阈值的 queued 任务即被收尸。
 
-    默认 90 分钟时 10 分钟前的 queued 不该被收；把配置调成 5 分钟后同一任务被收尸，
-    证明 reaper 的 cutoff 确实跟随配置（不是硬编码常量）。
+    默认 360 分钟（6 小时）时 10 分钟前的 queued 不该被收；把配置调成 5 分钟后
+    同一任务被收尸，证明 reaper 的 cutoff 确实跟随配置（不是硬编码常量）。
     """
     from datetime import datetime, timedelta
 
@@ -240,7 +240,7 @@ def test_stale_queued_reaper_timeout_is_configurable(client, worker_db, db_sessi
 
     settings = get_settings()
     default_timeout = settings.queued_task_timeout_min
-    assert default_timeout == 90, "默认阈值必须保持 90"
+    assert default_timeout == 360, "默认阈值必须保持 360（6 小时）"
 
     # 覆盖配置：阈值收到 5 分钟
     object.__setattr__(settings, "queued_task_timeout_min", 5)
@@ -261,7 +261,7 @@ def test_stale_queued_reaper_timeout_is_configurable(client, worker_db, db_sessi
     assert t.status == "failed", "调小阈值后，10 分钟前的 queued 任务应被收尸"
     assert "排队" in (t.error_msg or ""), t.error_msg
 
-    # 反向：恢复默认阈值（90）后，同样 10 分钟前的任务不再被收尸
+    # 反向：恢复默认阈值（360）后，同样 10 分钟前的任务不再被收尸
     other = Task(user_id=1, type="image", prompt="other", model="fake-image", status="queued")
     other.created_at = datetime.utcnow() - timedelta(minutes=10)
     db_session.add(other)
@@ -273,6 +273,30 @@ def test_stale_queued_reaper_timeout_is_configurable(client, worker_db, db_sessi
     db_session.expire_all()
     t2 = db_session.get(Task, other_id)
     assert t2.status == "queued", "默认阈值下 10 分钟前的 queued 不该被收尸"
+
+
+def test_queued_timeout_default_is_360_from_timeouts_constant():
+    """默认值链条：core/timeouts.CLEANUP_STALE_QUEUED_MIN = 360（6 小时），
+    且它是 Settings.queued_task_timeout_min 的默认来源。"""
+    from backend.app.core.config import get_settings
+    from backend.app.core.timeouts import CLEANUP_STALE_QUEUED_MIN
+
+    assert CLEANUP_STALE_QUEUED_MIN == 360
+    assert get_settings().queued_task_timeout_min == CLEANUP_STALE_QUEUED_MIN
+
+
+def test_queued_timeout_env_override_queued_task_timeout_min(monkeypatch):
+    """环境变量 QUEUED_TASK_TIMEOUT_MIN 生效：默认 360，设 42 → 42。"""
+    from backend.app.core.config import get_settings
+
+    assert get_settings().queued_task_timeout_min == 360
+    monkeypatch.setenv("QUEUED_TASK_TIMEOUT_MIN", "42")
+    get_settings.cache_clear()
+    try:
+        assert get_settings().queued_task_timeout_min == 42
+    finally:
+        monkeypatch.delenv("QUEUED_TASK_TIMEOUT_MIN")
+        get_settings.cache_clear()
 
 
 # ---- 4) review 竞态修复：认领守卫 + 终态写保护 ------------------------------

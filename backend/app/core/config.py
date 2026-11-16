@@ -39,7 +39,8 @@ class Settings(BaseSettings):
     # 审计批次二（P2）：每用户上传滚动配额（字节）——封堵磁盘填充向量
     upload_quota_bytes: int = Field(5 * 1024 * 1024 * 1024, alias="UPLOAD_QUOTA_BYTES")
     # queued 收尸阈值（分钟）：入队后超过此时长仍无人接手的 queued 任务标记失败。
-    # 默认取 core/timeouts.py CLEANUP_STALE_QUEUED_MIN（90），必须 > ARQ_JOB_TIMEOUT_S/60。
+    # 默认取 core/timeouts.py CLEANUP_STALE_QUEUED_MIN（360 = 6 小时），
+    # 必须 > ARQ_JOB_TIMEOUT_S/60。
     queued_task_timeout_min: int = Field(
         default=CLEANUP_STALE_QUEUED_MIN, alias="QUEUED_TASK_TIMEOUT_MIN", ge=1
     )
