@@ -135,31 +135,39 @@ def restore_snapshot(
     )
     db.commit()
 
-    # 全量替换节点/连线
+    # 全量替换节点/连线（client_id 保留在快照里，恢复后客户端可继续稳定 upsert）
     node_defs = json.loads(snap.nodes_json)
     conn_defs = json.loads(snap.connections_json)
     db.query(CanvasNode).filter(CanvasNode.project_id == project.id).delete()
+    id_map: dict[int, int] = {}
     for n in node_defs:
-        db.add(
-            CanvasNode(
-                project_id=project.id,
-                type=n["type"],
-                title=n.get("title", ""),
-                position_x=n["position"]["x"],
-                position_y=n["position"]["y"],
-                width=n.get("width"),
-                height=n.get("height"),
-                metadata_json=json.dumps(n.get("metadata") or {}, ensure_ascii=False),
-            )
+        meta = dict(n.get("metadata") or {})
+        node = CanvasNode(
+            project_id=project.id,
+            type=n["type"],
+            title=n.get("title", ""),
+            position_x=n["position"]["x"],
+            position_y=n["position"]["y"],
+            width=n.get("width"),
+            height=n.get("height"),
+            metadata_json=json.dumps(meta, ensure_ascii=False),
         )
+        db.add(node)
+        db.flush()  # 拿新 id
+        old_id = n.get("id")
+        if old_id is not None:
+            id_map[int(old_id)] = node.id
     for c in conn_defs:
         db.add(
             CanvasConnection(
                 project_id=project.id,
-                from_node_id=c["from_node_id"],
-                to_node_id=c["to_node_id"],
+                # 连线端点随节点重建映射（否则指向已不存在的旧 id → 悬空边）
+                from_node_id=id_map.get(int(c["from_node_id"]), int(c["from_node_id"])),
+                to_node_id=id_map.get(int(c["to_node_id"]), int(c["to_node_id"])),
             )
         )
+    # 恢复 = 服务端改动：bump revision，其他客户端下次保存会拿到 409 而非静默覆盖恢复态
+    project.revision = (project.revision or 0) + 1
     db.commit()
 
     nodes = db.query(CanvasNode).filter(CanvasNode.project_id == project.id).all()

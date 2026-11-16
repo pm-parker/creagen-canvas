@@ -37,6 +37,48 @@ describe("canvas store", () => {
     ]);
   });
 
+  it("loadFromApi：metadata.client_id 优先作节点 id（缺失才回退数据库 id）", () => {
+    useCanvasStore.getState().loadFromApi({
+      project: {
+        revision: 3,
+        viewport: "{}",
+        nodes: [
+          {
+            id: 101,
+            type: "image",
+            title: "有cid",
+            position: { x: 0, y: 0 },
+            metadata: { client_id: "uuid-1", extraUrls: ["/a.png"], durationSec: 6 },
+          },
+          {
+            id: 102,
+            type: "text",
+            title: "无cid",
+            position: { x: 5, y: 5 },
+            metadata: { prompt: "p" },
+          },
+        ],
+        connections: [{ id: 1, from_node_id: 101, to_node_id: 102 }],
+      },
+    });
+    const s = useCanvasStore.getState();
+    expect(s.nodes[0].id).toBe("uuid-1");
+    expect(s.nodes[1].id).toBe("102");
+    // 服务端写入的未知 metadata 键随节点携带（保存时合并回传）
+    expect(s.nodes[0].data.metadata).toMatchObject({
+      client_id: "uuid-1",
+      extraUrls: ["/a.png"],
+      durationSec: 6,
+    });
+    // 宽高随节点携带
+    expect(s.nodes[0].data.metadata).toBeTruthy();
+    // 连线端点翻译成 RF 节点 id（client_id）
+    expect(s.edges[0].source).toBe("uuid-1");
+    expect(s.edges[0].target).toBe("102");
+    // revision 记录（下次保存的乐观锁基准）
+    expect(s.revision).toBe(3);
+  });
+
   it("loaded=false 时 markDirtyIfLoaded 拒绝置脏（Review Focus #3）", () => {
     useCanvasStore.setState({ loaded: false });
     useCanvasStore.getState().markDirtyIfLoaded();

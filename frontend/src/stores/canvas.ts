@@ -29,9 +29,46 @@ export interface CanvasNodeData extends Record<string, unknown> {
   prompt: string;
   /** 生成回流结果（image 真实 URL / llm 完整文本已写入 prompt） */
   outputUrl?: string;
+  /** 节点尺寸（后端 width/height；保存时原样回传） */
+  width?: number;
+  height?: number;
+  /** 服务端回传的完整 metadata（保存时合并回传，未知键不丢） */
+  metadata?: Record<string, unknown>;
 }
 
 export interface CanvasNode extends Node<CanvasNodeData> {}
+
+/** 后端同步响应里的节点形状（宽/高/client_id 在顶层字段）。 */
+export interface ServerCanvasNode {
+  id: number;
+  client_id?: string | null;
+  type?: string;
+  title?: string;
+  position?: { x: number; y: number };
+  width?: number | null;
+  height?: number | null;
+  metadata?: Record<string, unknown> | null;
+}
+
+/** 后端节点 → RF 节点：metadata.client_id 优先作节点 id（无则回退数据库 id）。 */
+function serverNodeToCanvas(n: ServerCanvasNode): CanvasNode {
+  const meta = (n.metadata ?? {}) as Record<string, unknown>;
+  const cid = typeof meta.client_id === "string" && meta.client_id ? meta.client_id : String(n.id);
+  return {
+    id: cid,
+    type: "canvas",
+    position: n.position ?? { x: 0, y: 0 },
+    data: {
+      nodeType: (n.type as CanvasNodeType) ?? "text",
+      title: n.title ?? "",
+      prompt: typeof meta.prompt === "string" ? meta.prompt : "",
+      outputUrl: typeof meta.outputUrl === "string" ? meta.outputUrl : undefined,
+      width: n.width ?? undefined,
+      height: n.height ?? undefined,
+      metadata: meta,
+    },
+  };
+}
 
 interface CanvasState {
   nodes: CanvasNode[];
@@ -50,6 +87,12 @@ interface CanvasState {
   pushHistory: () => void;
   /** 从后端 project 响应整体装载（nodes/connections 全量替换语义） */
   loadFromApi: (resp: unknown) => void;
+  /** 从后端同步响应合并节点：服务端新增/服务端胜出的节点并入，本地未编辑节点
+   * 采纳服务端最新内容（宽度/元数据），本地仍在编辑的节点保留本地值 */
+  mergeServerNodes: (nodes: Array<ServerCanvasNode>) => void;
+  /** 记录保存成功的 base_revision（乐观锁：下次保存随请求携带） */
+  revision: number | null;
+  setRevision: (rev: number) => void;
   reset: () => void;
   setLoaded: (v: boolean) => void;
   markDirtyIfLoaded: () => void;
@@ -72,6 +115,7 @@ export const useCanvasStore = create<CanvasState>()((set, get) => ({
   edges: [],
   loaded: false,
   dirty: false,
+  revision: null,
   viewport: { x: 0, y: 0, zoom: 1 },
   undoStack: [],
   redoStack: [],
@@ -120,43 +164,57 @@ export const useCanvasStore = create<CanvasState>()((set, get) => ({
   loadFromApi: (resp) => {
     const data = resp as {
       project: {
+        revision?: number;
         viewport?: string;
-        nodes?: Array<{
-          id: number;
-          type: string;
-          title?: string;
-          position: { x: number; y: number };
-          metadata?: Record<string, unknown>;
-        }>;
+        nodes?: Array<ServerCanvasNode & { position: { x: number; y: number } }>;
         connections?: Array<{ id: number; from_node_id: number; to_node_id: number }>;
       };
     };
     const p = data.project;
-    const nodes: CanvasNode[] = (p.nodes ?? []).map((n) => ({
-      id: String(n.id),
-      type: "canvas",
-      position: n.position,
-      data: {
-        nodeType: (n.type as CanvasNodeType) ?? "text",
-        title: n.title ?? "",
-        prompt: typeof n.metadata?.prompt === "string" ? n.metadata.prompt : "",
-        outputUrl:
-          typeof n.metadata?.outputUrl === "string" ? (n.metadata.outputUrl as string) : undefined,
-      },
-    }));
-    const edges: Edge[] = (p.connections ?? []).map((c) => ({
-      id: `e-${c.from_node_id}-${c.to_node_id}`,
-      source: String(c.from_node_id),
-      target: String(c.to_node_id),
-    }));
+    const nodes: CanvasNode[] = (p.nodes ?? []).map(serverNodeToCanvas);
+    // 连线端点是数据库 id：翻译成 RF 节点 id（client_id）
+    const idByDbId = new Map<number, string>();
+    (p.nodes ?? []).forEach((n) => idByDbId.set(n.id, serverNodeToCanvas(n).id));
+    const edges: Edge[] = (p.connections ?? []).map((c) => {
+      const source = idByDbId.get(c.from_node_id) ?? String(c.from_node_id);
+      const target = idByDbId.get(c.to_node_id) ?? String(c.to_node_id);
+      return { id: `e-${source}-${target}`, source, target };
+    });
     let viewport = { x: 0, y: 0, zoom: 1 };
     try {
       viewport = toFlowViewport(JSON.parse(p.viewport ?? "{}"));
     } catch {
       /* 缺省视口 */
     }
-    set({ nodes, edges, viewport, loaded: true, dirty: false, undoStack: [], redoStack: [], canUndo: false, canRedo: false, historyDepth: 0 });
+    set({ nodes, edges, viewport, loaded: true, dirty: false, revision: p.revision ?? null, undoStack: [], redoStack: [], canUndo: false, canRedo: false, historyDepth: 0 });
   },
+
+  mergeServerNodes: (serverNodes) => {
+    const incoming = serverNodes.map(serverNodeToCanvas);
+    const byId = new Map(incoming.map((n) => [n.id, n]));
+    const cur = get().nodes;
+    // 本地节点保留（可能尚未保存）；服务端独有字段（outputUrl/尺寸/metadata）并入
+    const merged = cur.map((local) => {
+      const remote = byId.get(local.id);
+      if (!remote) return local;
+      return {
+        ...local,
+        data: {
+          ...local.data,
+          outputUrl: local.data.outputUrl ?? remote.data.outputUrl,
+          width: local.data.width ?? remote.data.width,
+          height: local.data.height ?? remote.data.height,
+          metadata: { ...(remote.data.metadata ?? {}), ...(local.data.metadata ?? {}) },
+        },
+      };
+    });
+    // 服务端新增（Agent 回流等）：追加
+    const localIds = new Set(cur.map((n) => n.id));
+    for (const n of incoming) if (!localIds.has(n.id)) merged.push(n);
+    set({ nodes: merged });
+  },
+
+  setRevision: (rev) => set({ revision: rev }),
 
   reset: () =>
     set({
@@ -164,6 +222,7 @@ export const useCanvasStore = create<CanvasState>()((set, get) => ({
       edges: [],
       loaded: false,
       dirty: false,
+      revision: null,
       viewport: { x: 0, y: 0, zoom: 1 },
       undoStack: [],
       redoStack: [],

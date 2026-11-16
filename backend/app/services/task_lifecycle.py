@@ -33,20 +33,13 @@ def _writeback_canvas_node(db, task, result: dict) -> None:
     try:
         import json as _json
 
-        from backend.app.models import CanvasNode
+        from backend.app.services.canvas_writeback import find_node_by_client_id
 
-        # 按 client_id 定位节点（metadata JSON 含 client_id；agent 端点创建的节点必带）
-        nodes = (
-            db.query(CanvasNode)
-            .filter(
-                CanvasNode.project_id == target.get("project_id"),
-                CanvasNode.metadata_json.contains(f'"client_id": "{target["node_client_id"]}"'),
-            )
-            .all()
-        )
-        if not nodes:
+        # 按 client_id 定位节点：解析 metadata JSON 后比对字段值（不得子串匹配原始
+        # JSON 字符串——客户端重存会重排序/重转义键，导致回写丢失目标节点）
+        node = find_node_by_client_id(db, target.get("project_id"), target["node_client_id"])
+        if node is None:
             return
-        node = nodes[0]
         meta = _json.loads(node.metadata_json or "{}")
         if not isinstance(meta, dict):
             meta = {}

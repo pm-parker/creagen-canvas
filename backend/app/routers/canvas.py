@@ -19,8 +19,36 @@ from backend.app.schemas.canvas import (
     ProjectCreate,
     ProjectUpdate,
 )
+from backend.app.services.canvas_writeback import CREATED_REV_KEY, parse_canvas_meta
 
 router = APIRouter(prefix="/api/canvas", tags=["canvas"])
+
+# 服务端写入的 metadata 键：客户端回传 null 时不得清空（防 outputUrl/时长等丢失）
+SERVER_WRITTEN_META_KEYS = frozenset(
+    {
+        "outputUrl",
+        "extraUrls",
+        "durationSec",
+        "resolution",
+        "canvas_agent",
+        "canvas_agent_error",
+        "source",
+        "imported_reference",
+        "storyboardFinal",
+        "text",
+        "notice_kind",
+        "agent_run_id",
+    }
+)
+
+# 节点创建时的画布 revision（服务端托管）：用于判定"客户端加载之后新建"的节点，
+# 这类节点不得被陈旧的客户端保存删除（数据丢失 bug 的根因之一）。
+# 常量定义见 backend/app/services/canvas_writeback.py
+
+
+def _parse_meta(raw: str | None) -> dict:
+    """metadata_json → dict（脏数据容错为空 dict）。"""
+    return parse_canvas_meta(raw)
 
 
 def _own_project_or_404(db: Session, project_id: int, user: User) -> CanvasProject:
@@ -308,7 +336,12 @@ def sync_nodes(
     并发保护（H1）：body.base_revision 与 project.revision 不一致时 409
     REVISION_CONFLICT（携带当前 revision），由客户端合并后重试；
     不带 base_revision（外部工具/旧客户端）跳过校验直接应用。
-    删除语义：仅删除带 client_id 的既有节点中不在本次集合者；
+    命中规则：client_id 命中既有节点的 metadata.client_id；旧客户端把数据库 id
+    当 client_id 传（str(existing.id)）也命中 → 原地 UPDATE（数据库 id 不变）。
+    metadata 合并：客户端键覆盖同名键，服务端写入的键（outputUrl/extraUrls/
+    durationSec 等）缺失或为 null 时保留服务端既有值；width/height 未提供则保留。
+    删除语义：只删"客户端本就知道"的既有节点（本次集合外、且非服务端 Agent 节点、
+    且创建 revision 不晚于 base_revision）；服务端在客户端加载后新建的节点保留。
     无 client_id 的存量节点（外部写入）保留不删。
     """
     project = _own_project_or_404(db, project_id, user)
@@ -327,10 +360,9 @@ def sync_nodes(
 
     incoming: list[tuple[object, dict]] = []
     for item in body.nodes:
+        raw = item.metadata_json or "{}"
         try:
-            parsed = _json.loads(item.metadata_json or "{}")
-            if not isinstance(parsed, dict):
-                raise ValueError
+            parsed = _json.loads(raw)
         except _json.JSONDecodeError as e:
             raise HTTPException(
                 status_code=422,
@@ -339,43 +371,95 @@ def sync_nodes(
                     "message": f"节点 {item.title or item.type} 的 metadata 不是合法 JSON",
                 },
             ) from e
+        if not isinstance(parsed, dict):
+            # 合法 JSON 但不是对象（'[]' / '1' / '"x"'）→ 422，不 500
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "METADATA_INVALID",
+                    "message": f"节点 {item.title or item.type} 的 metadata 必须是 JSON 对象",
+                },
+            )
         incoming.append((item, parsed))
 
     existing = db.query(CanvasNode).filter(CanvasNode.project_id == project.id).all()
     by_cid: dict[str, CanvasNode] = {}
+    by_db_id: dict[str, CanvasNode] = {}
+    meta_by_node: dict[int, dict] = {}
     for n in existing:
-        try:
-            meta = _json.loads(n.metadata_json or "{}")
-            cid = meta.get("client_id") if isinstance(meta, dict) else None
-        except _json.JSONDecodeError:
-            cid = None
+        meta = _parse_meta(n.metadata_json)
+        meta_by_node[n.id] = meta
+        by_db_id[str(n.id)] = n
+        cid = meta.get("client_id")
         if cid:
             by_cid[str(cid)] = n
 
     incoming_cids = {
         str(parsed.get("client_id")) for _, parsed in incoming if parsed.get("client_id")
     }
+    # 先解析命中目标（client_id 优先；旧客户端传数据库 id 也命中）→ 命中的节点不删
+    matched: set[int] = set()
+    for _item, parsed in incoming:
+        cid = parsed.get("client_id")
+        hit: CanvasNode | None = None
+        if cid:
+            hit = by_cid.get(str(cid)) or by_db_id.get(str(cid))
+        if hit is not None:
+            matched.add(int(hit.id))
+
     if incoming_cids:
-        # UI 保存形态：只删带 cid 且不在本次集合的（无 cid 存量=外部写入，保留）
+        # UI 保存形态：只删"客户端本就知道"的节点
         for cid, node in by_cid.items():
-            if cid not in incoming_cids:
-                db.delete(node)
+            if cid in incoming_cids:
+                continue
+            if node.id in matched:
+                continue  # 本次提交命中（legacy 客户端按数据库 id 回传）
+            meta = meta_by_node.get(int(node.id), {})
+            if meta.get("canvas_agent"):
+                # 服务端 Agent 建的节点：客户端无权删除
+                continue
+            created_rev = meta.get(CREATED_REV_KEY)
+            if (
+                body.base_revision is not None
+                and isinstance(created_rev, int)
+                and created_rev > body.base_revision
+            ):
+                # 客户端加载之后新建的节点（Agent 回流等）：保留，不被陈旧保存删除
+                continue
+            db.delete(node)
     else:
         # 外部直写形态（payload 全无 client_id）：保持旧全量替换语义
         db.query(CanvasNode).filter(CanvasNode.project_id == project.id).delete()
 
+    new_rev = (project.revision or 0) + 1
     for item, parsed in incoming:
         cid = parsed.get("client_id")
-        target = by_cid.get(str(cid)) if cid else None
+        target: CanvasNode | None = None
+        if cid:
+            # 优先 client_id 命中；旧客户端传 str(数据库 id) 也命中（原地更新）
+            target = by_cid.get(str(cid)) or by_db_id.get(str(cid))
         if target is not None:
+            old_meta = meta_by_node.get(int(target.id), {})
+            merged = dict(old_meta)
+            for k, v in parsed.items():
+                if k == CREATED_REV_KEY:
+                    continue  # 服务端托管字段，忽略客户端回传
+                if k in SERVER_WRITTEN_META_KEYS and v is None:
+                    continue  # 客户端 null 不得清空服务端写入的字段
+                merged[k] = v
+            merged[CREATED_REV_KEY] = old_meta.get(CREATED_REV_KEY, new_rev)
             target.type = item.type
             target.title = item.title
             target.position_x = item.position_x
             target.position_y = item.position_y
-            target.width = item.width
-            target.height = item.height
-            target.metadata_json = item.metadata_json
+            if item.width is not None:
+                target.width = item.width
+            if item.height is not None:
+                target.height = item.height
+            target.metadata_json = _json.dumps(merged, ensure_ascii=False)
         else:
+            meta = {k: v for k, v in parsed.items() if k != CREATED_REV_KEY}
+            meta[CREATED_REV_KEY] = new_rev
             db.add(
                 CanvasNode(
                     project_id=project.id,
@@ -385,10 +469,10 @@ def sync_nodes(
                     position_y=item.position_y,
                     width=item.width,
                     height=item.height,
-                    metadata_json=item.metadata_json,
+                    metadata_json=_json.dumps(meta, ensure_ascii=False),
                 )
             )
-    project.revision = (project.revision or 0) + 1
+    project.revision = new_rev
     db.commit()
     nodes = db.query(CanvasNode).filter(CanvasNode.project_id == project.id).all()
     return {"nodes": [n.to_dict() for n in nodes], "revision": project.revision}
@@ -530,6 +614,8 @@ async def _agent_generate_core(
     py = explicit_params.pop("y", None)
 
     node_cid = f"agent-{_uuid.uuid4().hex[:10]}"
+    # 服务端建节点 = 画布被服务端改动 → revision 递增（客户端陈旧保存会拿到 409 而非静默覆盖）
+    project.revision = (project.revision or 0) + 1
     node = CanvasNode(
         project_id=project.id,
         type=body.type if body.type in {"text", "image", "video", "audio"} else "image",
@@ -540,6 +626,7 @@ async def _agent_generate_core(
             "client_id": node_cid,
             "prompt": body.message.strip(),
             "canvas_agent": True,
+            CREATED_REV_KEY: project.revision,
             **({"source": f"agent_run:{agent_run_id}"} if agent_run_id else {}),
         }, ensure_ascii=False),
     )
