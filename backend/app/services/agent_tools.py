@@ -136,14 +136,11 @@ async def _tool_generate(ctx: ToolContext, args: dict[str, Any], ntype: str) -> 
         return _err(f"[{detail.get('code', 'REJECTED')}] {detail.get('message', '')}")
 
     # 参考脉络物化：@素材/取帧 URL → 画布节点 + 参考图→新节点连线（创作说明书）
+    from backend.app.services.canvas_writeback import find_node_by_client_id
+
     reference_node_ids: list[int] = []
     new_node = (
-        ctx.db.query(CanvasNode)
-        .filter(
-            CanvasNode.project_id == ctx.project_id,
-            CanvasNode.metadata_json.like(f"%{result.get('node_client_id', '')}%"),
-        )
-        .first()
+        find_node_by_client_id(ctx.db, ctx.project_id, result.get("node_client_id"))
         if result.get("node_client_id")
         else None
     )

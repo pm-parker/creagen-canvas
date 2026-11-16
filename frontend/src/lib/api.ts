@@ -6,11 +6,16 @@ export class ApiError extends Error {
   hint: string;
   status: number;
 
-  constructor(code: string, message: string, hint: string, status: number) {
+  constructor(code: string, message: string, hint: string, status: number, cause?: unknown) {
     super(message);
     this.code = code;
     this.hint = hint;
     this.status = status;
+    if (cause !== undefined) {
+      // 后端 detail 全量透传（如 409 REVISION_CONFLICT 携带的 current_revision/nodes/
+      // connections）——调用方可从 cause 读取，无需额外 GET
+      (this as { cause?: unknown }).cause = cause;
+    }
   }
 }
 
@@ -60,7 +65,13 @@ export async function apiFetch<T = unknown>(path: string, opts: ApiFetchOptions 
 
   if (parsed && _looksLikeEnvelopeError(data)) {
     const detail = (data as { detail: { code?: string; message?: string; hint?: string } }).detail;
-    throw new ApiError(detail.code ?? "API_ERROR", detail.message ?? "请求失败", detail.hint ?? "", resp.status);
+    throw new ApiError(
+      detail.code ?? "API_ERROR",
+      detail.message ?? "请求失败",
+      detail.hint ?? "",
+      resp.status,
+      detail,
+    );
   }
 
   if (!resp.ok) {
