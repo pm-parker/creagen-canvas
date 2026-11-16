@@ -87,13 +87,33 @@ def merge_task_params(db: Session, task_id: int, extra: dict[str, Any]) -> None:
     db.commit()
 
 
+def _fresh_cancel_state(db: Session, task_id: int) -> tuple[str | None, object]:
+    """直读 DB 最新 (status, cancel_requested_at)，绕过 identity map 缓存。
+
+    worker / API 是两个进程两个会话，expire_on_commit=False 时 db.get 命中的
+    是本会话缓存的 Task 实例——另一进程提交的取消标记永远看不见。
+    这里只 SELECT 列值（不加载 ORM 实体），因此不会覆盖本会话的待写状态。
+    """
+    from sqlalchemy import select
+
+    stmt = select(Task.status, Task.cancel_requested_at).where(Task.id == task_id)
+    with db.no_autoflush:  # 不打断会话内未 flush 的 pending 变更
+        row = db.execute(stmt).first()
+    if row is None:
+        return None, None
+    return row[0], row[1]
+
+
 def mark_cancel_requested(db: Session, task_id: int) -> bool:
     from datetime import datetime
 
     task = get_task_or_none(db, task_id)
-    if task is None or task.status not in {"queued", "generating"}:
+    if task is None:
         return False
-    if task.cancel_requested_at is not None:
+    status, cancel_at = _fresh_cancel_state(db, task_id)
+    if status is not None and status not in {"queued", "generating"}:
+        return False  # 已终态：不得复活取消标记
+    if cancel_at is not None:
         return True
     task.cancel_requested_at = datetime.utcnow()
     db.commit()
@@ -101,5 +121,6 @@ def mark_cancel_requested(db: Session, task_id: int) -> bool:
 
 
 def is_cancel_requested(db: Session, task_id: int) -> bool:
-    task = get_task_or_none(db, task_id)
-    return task is not None and task.cancel_requested_at is not None
+    """任务是否已被请求取消（读 DB 最新值，不用会话缓存）。"""
+    _status, cancel_at = _fresh_cancel_state(db, task_id)
+    return cancel_at is not None

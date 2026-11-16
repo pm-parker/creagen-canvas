@@ -33,6 +33,66 @@ logger = logging.getLogger("canvas.worker")
 
 _coroutine_count: int = 0
 
+# queued 收尸文案（用户可见）：任务长时间排队未被执行
+_STALE_QUEUED_MSG = "排队超时：任务长时间未被执行（队列或服务异常），请重试"
+
+
+async def _fail_before_lifecycle(db, task_id: int, exc: Exception) -> dict[str, Any]:
+    """生命周期启动前的异常兑底：任务不得永远卡 queued。
+
+    run_task_lifecycle 之前的任何异常（预算熔断 / 渠道解析 / provider 构造…）
+    此前会直接抛出——任务永远停在 queued，SSE 无终态事件，前端节点卡
+    「生成中」。此处统一落 failed + 发终态事件（与 lifecycle 失败路径同口径），
+    不再重抛（重抛 = arq 重试一个注定失败的任务，且重试间隙仍是 queued）。
+    """
+    from backend.app.services.llm_budget import BudgetExceeded
+
+    error_msg = str(exc) or exc.__class__.__name__
+    if isinstance(exc, BudgetExceeded):
+        error_msg = "当日 LLM 预算已耗尽，明天再试或联系管理员调整"
+    marked = False
+    try:
+        task = get_task_or_none(db, task_id)
+        if task is not None and task.status in {"queued", "generating"}:
+            task.mark_failed(error_msg)
+            db.commit()
+            marked = True
+        else:
+            # 任务不存在 / 已终态（arq 重投或取消竞态）：尊重既有终态不覆盖
+            db.rollback()
+    except Exception:  # noqa: BLE001 — 落库失败不掩盖原始错误
+        db.rollback()
+        logger.exception("_fail_before_lifecycle: persist failed for task %s", task_id)
+    if marked:
+        # 终态事件只在本路径真的改了终态时发——避免给已完成任务补发 failed
+        publish_task_event(task_id, "failed", {"error": error_msg})
+        logger.error("task %s failed before lifecycle: %s", task_id, error_msg)
+    else:
+        logger.warning(
+            "task %s failed before lifecycle (terminal state kept): %s", task_id, error_msg
+        )
+    return {"status": "failed", "error": error_msg}
+
+
+def _release_reserved_budget(db, budget_state: dict[str, Any] | None) -> None:
+    """启动前即失败的 LLM 任务：退回预扣的当日 token（不占用户额度）。"""
+    if not budget_state:
+        return
+    from backend.app.services.llm_budget import budget_release
+
+    try:
+        budget_release(
+            db,
+            budget_state["scope"],
+            budget_state["prompt_tokens"],
+            calls=budget_state["calls"],
+        )
+    except Exception:  # noqa: BLE001 — 退款失败不改变失败终态
+        db.rollback()
+        logger.warning(
+            "budget release failed for %s (task stuck-refund)", budget_state["scope"]
+        )
+
 
 async def run_generation_task(
     ctx: dict[str, Any], task_id: int, _gen_override: Any = None
@@ -44,6 +104,8 @@ async def run_generation_task(
     from backend.app.core.config import get_settings as _gs
 
     db = get_session_factory()()
+    _budget_state: dict[str, Any] | None = None
+    _lifecycle_started = False
     try:
         task = get_task_or_none(db, task_id)
         if task is None:
@@ -63,8 +125,14 @@ async def run_generation_task(
         if task.type == "llm":
             from backend.app.services.llm_budget import budget_check, budget_consume
 
-            budget_check(db, f"llm:{task.user_id}")
-            budget_consume(db, f"llm:{task.user_id}", len(task.prompt) * 2, 0, calls=1)
+            _scope = f"llm:{task.user_id}"
+            budget_check(db, _scope)
+            _prompt_tokens = len(task.prompt) * 2
+            budget_consume(db, _scope, _prompt_tokens, 0, calls=1)
+            # 预扣登记：生命周期未启动即失败时回退（见尾部 except）
+            _budget_state = {
+                "scope": _scope, "prompt_tokens": _prompt_tokens, "calls": 1
+            }
         try:
             provider, _channel = resolve_provider_for_task(
                 db, task.user_id, task.type, task.model, channel_id=channel_id
@@ -195,6 +263,7 @@ async def run_generation_task(
                 return {"status": "failed", "error": msg}
             _gate_held = True
         try:
+            _lifecycle_started = True
             result = await run_task_lifecycle(
                 db, task_id, generate_with_retry,
                 user_id=task.user_id, estimated_cost=estimated_cost,
@@ -220,6 +289,13 @@ async def run_generation_task(
         except Exception:  # noqa: BLE001
             logger.exception("agent advance failed for task %s", task_id)
         return result
+    except Exception as exc:  # noqa: BLE001 — 启动前异常：落 failed，不得永远卡 queued
+        # run_task_lifecycle 已兜底其内部的失败（返回 failed 而非抛出）；能走到这里的
+        # 异常几乎都发生在生命周期标记之前（预算/渠道解析/provider 构造/闸门）。
+        if not _lifecycle_started:
+            # 生命周期未启动 → 预扣的 LLM 额度退回（用户不为失败的提交买单）
+            _release_reserved_budget(db, _budget_state)
+        return await _fail_before_lifecycle(db, task_id, exc)
     finally:
         db.close()
 
@@ -443,6 +519,47 @@ async def _cleanup_stale_tasks() -> None:
     except Exception:  # noqa: BLE001 — 维护任务不因单次失败退出
         db.rollback()
         logger.exception("cleanup_stale_tasks failed")
+    # queued 收尸：入队后长时间无人接手（队列/worker 崩溃遗留）——同样条件 UPDATE 防竞态。
+    # 用 created_at（排队起点）而非 started_at（从未开始），且阈值独立且更大
+    # （queued 生命周期含排队预算，见 core/timeouts.py CLEANUP_STALE_QUEUED_MIN）。
+    try:
+        from backend.app.core.timeouts import CLEANUP_STALE_QUEUED_MIN
+
+        cutoff_q = datetime.utcnow() - timedelta(minutes=CLEANUP_STALE_QUEUED_MIN)
+        stale_q = (
+            db.query(Task)
+            .filter(
+                Task.status == "queued",
+                Task.created_at.isnot(None),
+                Task.created_at < cutoff_q,
+            )
+            .all()
+        )
+        reaped_q = 0
+        for t in stale_q:
+            n = (
+                db.query(Task)
+                .filter(Task.id == t.id, Task.status == "queued")
+                .update(
+                    {
+                        "status": "failed",
+                        "phase": "failed",
+                        "error_msg": _STALE_QUEUED_MSG,
+                        "completed_at": datetime.utcnow(),
+                    },
+                    synchronize_session=False,
+                )
+            )
+            db.commit()
+            if n == 0:
+                continue  # 已被并发写终态（恰好被 worker 取走）——尊重结果
+            reaped_q += 1
+            publish_task_event(t.id, "failed", {"error": _STALE_QUEUED_MSG})
+        if reaped_q:
+            logger.info("cleanup_stale_tasks: marked %d stale queued task(s) failed", reaped_q)
+    except Exception:  # noqa: BLE001 — 维护任务不因单次失败退出
+        db.rollback()
+        logger.exception("cleanup stale queued tasks failed")
     finally:
         db.close()
 

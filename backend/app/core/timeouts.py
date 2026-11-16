@@ -23,3 +23,8 @@ H3W_DOWNLOAD_TIMEOUT_S = 300.0  # 算力仓产物下载（几十 MB 视频，独
 
 # cleanup 收尸阈值（> 所有 provider 总超时：超此仍 generating 的必是孤儿）
 CLEANUP_STALE_MIN = 30
+
+# queued 收尸阈值（入队即计时，含排队 + 生成全链路）：必须 > ARQ_JOB_TIMEOUT_S，
+# 否则会把仍在排队预算内的正常任务误杀。独立成常量：queued 生命周期比
+# generating 长（arq 从入队计时，排队也吃预算），阈值应显著大于上面那档。
+CLEANUP_STALE_QUEUED_MIN = 90
