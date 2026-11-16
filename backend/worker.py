@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import logging
 import os
+from datetime import datetime
 from typing import Any
 
 from arq import cron
@@ -27,11 +28,95 @@ from backend.app.services.task_queue import (
     publish_task_event,
     redis_settings_from_url,
 )
-from backend.app.services.task_store import get_task_or_none
+from backend.app.services.task_store import (
+    TERMINAL_TASK_STATUSES,
+    _fresh_cancel_state,
+    _guarded_terminal_write,
+    get_task_or_none,
+)
+
+
+def _fresh_task_status(db, task_id: int) -> str | None:
+    """直读 DB 最新 status（绕过会话缓存）：worker 会话 expire_on_commit=False。"""
+    status, _cancel_at = _fresh_cancel_state(db, task_id)
+    return status
+
 
 logger = logging.getLogger("canvas.worker")
 
 _coroutine_count: int = 0
+
+# queued 收尸文案（用户可见）：任务长时间排队未被执行
+_STALE_QUEUED_MSG = "排队超时：任务长时间未被执行（队列或服务异常），请重试"
+
+
+async def _fail_before_lifecycle(db, task_id: int, exc: Exception) -> dict[str, Any]:
+    """生命周期启动前的异常兑底：任务不得永远卡 queued。
+
+    run_task_lifecycle 之前的任何异常（预算熔断 / 渠道解析 / provider 构造…）
+    此前会直接抛出——任务永远停在 queued，SSE 无终态事件，前端节点卡
+    「生成中」。此处统一落 failed + 发终态事件（与 lifecycle 失败路径同口径），
+    不再重抛（重抛 = arq 重试一个注定失败的任务，且重试间隙仍是 queued）。
+    """
+    from backend.app.services.llm_budget import BudgetExceeded
+
+    error_msg = str(exc) or exc.__class__.__name__
+    if isinstance(exc, BudgetExceeded):
+        error_msg = "当日 LLM 预算已耗尽，明天再试或联系管理员调整"
+    marked = False
+    try:
+        task = get_task_or_none(db, task_id)
+        # 终态写保护（条件 CAS）：仅当任务仍非终态时才落 failed——被收尸 reaper
+        # /取消并发先写终态的，尊重既有结论不覆盖（rowcount=0 → 不发终态事件）
+        fresh_status = _fresh_task_status(db, task_id)
+        if task is not None and fresh_status not in TERMINAL_TASK_STATUSES:
+            marked = bool(
+                _guarded_terminal_write(
+                    db,
+                    task_id,
+                    fresh_status or "",
+                    {
+                        "status": "failed",
+                        "phase": "failed",
+                        "error_msg": error_msg,
+                        "completed_at": datetime.utcnow(),
+                    },
+                )
+            )
+        else:
+            db.rollback()
+    except Exception:  # noqa: BLE001 — 落库失败不掩盖原始错误
+        db.rollback()
+        logger.exception("_fail_before_lifecycle: persist failed for task %s", task_id)
+    if marked:
+        # 终态事件只在本路径真的改了终态时发——避免给已完成任务补发 failed
+        publish_task_event(task_id, "failed", {"error": error_msg})
+        logger.error("task %s failed before lifecycle: %s", task_id, error_msg)
+    else:
+        logger.warning(
+            "task %s failed before lifecycle (terminal state kept): %s", task_id, error_msg
+        )
+    return {"status": "failed", "error": error_msg}
+
+
+def _release_reserved_budget(db, budget_state: dict[str, Any] | None) -> None:
+    """启动前即失败的 LLM 任务：退回预扣的当日 token（不占用户额度）。"""
+    if not budget_state:
+        return
+    from backend.app.services.llm_budget import budget_release
+
+    try:
+        budget_release(
+            db,
+            budget_state["scope"],
+            budget_state["prompt_tokens"],
+            calls=budget_state["calls"],
+        )
+    except Exception:  # noqa: BLE001 — 退款失败不改变失败终态
+        db.rollback()
+        logger.warning(
+            "budget release failed for %s (task stuck-refund)", budget_state["scope"]
+        )
 
 
 async def run_generation_task(
@@ -41,21 +126,42 @@ async def run_generation_task(
 
     _gen_override 仅测试注入（跳过 provider 解析直接给生成函数）。
     """
-    from backend.app.core.config import get_settings as _gs
+    from backend.app.services.task_store import claim_queued_task
 
     db = get_session_factory()()
+    _budget_state: dict[str, Any] | None = None
+    _lifecycle_started = False
     try:
+        # 入口认领守卫（review 竞态修复）：job 可能是压仓积压——取到时任务已被
+        # queued 收尸 reaper 标 failed、被另一 worker（arq 重投）抢先执行、或已
+        # 终态。先直读 DB 最新状态，非 queued 直接放弃（绝不复活终态、不重复
+        # 生成）；仍 queued 则条件 UPDATE 原子抢占 queued→generating（两 worker
+        # 同时认领只有一个成功）。
+        claimed = claim_queued_task(db, task_id)
+        if claimed != "claimed":
+            logger.warning(
+                "task %s skipped at job entry: current status=%r (claimed by other "
+                "worker / reaped / terminal)",
+                task_id, claimed,
+            )
+            return {
+                "status": "skipped",
+                "task_status": claimed or "missing",
+                "error": f"task no longer queued (status={claimed or 'missing'})",
+            }
+
         task = get_task_or_none(db, task_id)
         if task is None:
             logger.error("Task %s not found", task_id)
             return {"status": "failed", "error": "task not found"}
 
+        task_params = task.params_dict()
+        channel_id = task_params.get("channel_id")
+
         from backend.app.core.config import get_settings as _gs
         from backend.app.core.errors import ProviderNotConfiguredError
         from backend.app.services.provider_service import resolve_provider_for_task
 
-        task_params = task.params_dict()
-        channel_id = task_params.get("channel_id")
         # 配置价优先，内置建议价回落（spec §5.2）；含 channel_id 才能同名模型按渠道精确计价
         estimated_cost = resolve_cost(
             db, task.type, task.model, task_params, channel_id=channel_id, prompt=task.prompt
@@ -63,14 +169,22 @@ async def run_generation_task(
         if task.type == "llm":
             from backend.app.services.llm_budget import budget_check, budget_consume
 
-            budget_check(db, f"llm:{task.user_id}")
-            budget_consume(db, f"llm:{task.user_id}", len(task.prompt) * 2, 0, calls=1)
+            _scope = f"llm:{task.user_id}"
+            budget_check(db, _scope)
+            _prompt_tokens = len(task.prompt) * 2
+            budget_consume(db, _scope, _prompt_tokens, 0, calls=1)
+            # 预扣登记：生命周期未启动即失败时回退（见尾部 except）
+            _budget_state = {
+                "scope": _scope, "prompt_tokens": _prompt_tokens, "calls": 1
+            }
         try:
             provider, _channel = resolve_provider_for_task(
                 db, task.user_id, task.type, task.model, channel_id=channel_id
             )
             # 局部重绘：渠道必须显式开启 edit 能力（开放架构——支持 /images/edits 的渠道自行勾选）。
             # 注意：此处位于 task_lifecycle 之前，失败必须直接落库（抛异常会让任务卡 queued）。
+            # 终态写保护（条件 CAS）：任务已被认领为 generating，但若期间被并发
+            # 写终态（取消/收尸），这里不得覆盖——争写失败即放弃。
             if task.type == "image" and task_params.get("mode") == "edit":
                 caps = _channel._capabilities_list() if _channel is not None else []
                 if "edit" not in caps and "edit_ref" not in caps:
@@ -78,11 +192,21 @@ async def run_generation_task(
                         "当前渠道未开启图像编辑能力。请在「模型渠道」编辑该渠道并勾选"
                         "「支持图像编辑」或「支持参考图编辑」，或更换支持的渠道。"
                     )
-                    task.status = "failed"
-                    task.error_msg = msg
-                    db.commit()
-                    # 直接落库路径也必须发布终态事件：否则 SSE 订阅者永远收不到，
-                    # 前端节点卡"生成中"（教训⑨配套）
+                    if not _guarded_terminal_write(
+                        db,
+                        task_id,
+                        "generating",
+                        {
+                            "status": "failed",
+                            "phase": "failed",
+                            "error_msg": msg,
+                            "completed_at": datetime.utcnow(),
+                        },
+                    ):
+                        logger.warning(
+                            "task %s edit capability missing but terminal state kept", task_id
+                        )
+                        return {"status": "failed", "error": msg, "superseded": True}
                     publish_task_event(task_id, "failed", {"error": msg})
                     logger.warning("task %s edit capability missing", task_id)
                     return {"status": "failed", "error": msg}
@@ -188,13 +312,42 @@ async def run_generation_task(
 
             if not await acquire_video_gate(_gate_redis, _gate_ch, limit=_gate_limit):
                 msg = "视频排队超时（渠道并发闸门），请稍后重试或错峰提交"
-                task.status = "failed"
-                task.error_msg = msg
-                db.commit()
+                # 终态写保护：并发已写终态则不覆盖（与 lifecycle 同口径）
+                if not _guarded_terminal_write(
+                    db,
+                    task_id,
+                    "generating",
+                    {
+                        "status": "failed",
+                        "phase": "failed",
+                        "error_msg": msg,
+                        "completed_at": datetime.utcnow(),
+                    },
+                ):
+                    return {"status": "failed", "error": msg, "superseded": True}
                 publish_task_event(task_id, "failed", {"error": msg})
                 return {"status": "failed", "error": msg}
             _gate_held = True
+        # 闸门后复检（review 事故修复）：闸门前排队最长 3500s，期间任务可能已被
+        # 并发写终态（取消 / 收尸）。再启动生成前直读 DB 最新状态，已终态/被改写
+        # 则直接放弃——不跑 provider、不覆盖既有终态。started_at 由 lifecycle 的
+        # mark_started 在此刻之后写入，闸门等待不计入 30 分钟生成超时。
+        from backend.app.services.task_store import ensure_claimed_task_startable
+
+        recheck = ensure_claimed_task_startable(db, task_id)
+        if recheck is not None:
+            logger.warning(
+                "task %s skipped after gate (status=%r): terminal/cancelled while "
+                "waiting at channel gate",
+                task_id, recheck,
+            )
+            return {
+                "status": "skipped",
+                "task_status": recheck or "missing",
+                "error": f"task no longer claimable after gate (status={recheck or 'missing'})",
+            }
         try:
+            _lifecycle_started = True
             result = await run_task_lifecycle(
                 db, task_id, generate_with_retry,
                 user_id=task.user_id, estimated_cost=estimated_cost,
@@ -220,6 +373,13 @@ async def run_generation_task(
         except Exception:  # noqa: BLE001
             logger.exception("agent advance failed for task %s", task_id)
         return result
+    except Exception as exc:  # noqa: BLE001 — 启动前异常：落 failed，不得永远卡 queued
+        # run_task_lifecycle 已兜底其内部的失败（返回 failed 而非抛出）；能走到这里的
+        # 异常几乎都发生在生命周期标记之前（预算/渠道解析/provider 构造/闸门）。
+        if not _lifecycle_started:
+            # 生命周期未启动 → 预扣的 LLM 额度退回（用户不为失败的提交买单）
+            _release_reserved_budget(db, _budget_state)
+        return await _fail_before_lifecycle(db, task_id, exc)
     finally:
         db.close()
 
@@ -400,6 +560,10 @@ async def _cleanup_stale_tasks() -> None:
             db.query(Task)
             .filter(
                 Task.status == "generating",
+                # started_at IS NULL = 已认领但生成未开始（视频任务在渠道闸门
+                # 前排队，claim 不再预写 started_at）——闸门等待不计入 30 分钟
+                # 生成超时，这里绝不能收尸；闸门排队超时由闸门自身/回询兜底。
+                Task.started_at.isnot(None),
                 Task.started_at < cutoff,
             )
             .all()
@@ -443,6 +607,63 @@ async def _cleanup_stale_tasks() -> None:
     except Exception:  # noqa: BLE001 — 维护任务不因单次失败退出
         db.rollback()
         logger.exception("cleanup_stale_tasks failed")
+    # queued 收尸：入队后长时间无人接手（队列/worker 崩溃遗留）——同样条件 UPDATE 防竞态。
+    # 用 created_at（排队起点）而非 started_at（从未开始），且阈值独立且更大、可配置
+    # （queued 生命周期含排队预算，默认 QUEUED_TASK_TIMEOUT_MIN=360 即 6 小时，见 core/config.py）。
+    # 同口径覆盖“已认领但卡在闸门前”的孤儿（generating + started_at IS NULL）：
+    # 30 分钟 generating 收尸豁免这类任务（闸门等待不计超时），而闸门自身排队
+    # 上限远小于本阈值——若它在此仍卡着，只可能是 worker 崩溃遗留，必须回收。
+    try:
+        from sqlalchemy import and_, or_
+
+        cutoff_q = datetime.utcnow() - timedelta(minutes=get_settings().queued_task_timeout_min)
+        stale_q = (
+            db.query(Task)
+            .filter(
+                Task.created_at.isnot(None),
+                Task.created_at < cutoff_q,
+                or_(
+                    Task.status == "queued",
+                    and_(Task.status == "generating", Task.started_at.is_(None)),
+                ),
+            )
+            .all()
+        )
+        reaped_q = 0
+        for t in stale_q:
+            # 条件 UPDATE 防竞态：仅当仍处于被回收前提态时生效（正在被 worker
+            # 接手/开跑的不会被误杀）
+            if t.status == "queued":
+                cond = (Task.id == t.id, Task.status == "queued")
+            else:  # generating + 闸门排队中（认领未开表）
+                cond = (
+                    Task.id == t.id,
+                    Task.status == "generating",
+                    Task.started_at.is_(None),
+                )
+            n = (
+                db.query(Task)
+                .filter(*cond)
+                .update(
+                    {
+                        "status": "failed",
+                        "phase": "failed",
+                        "error_msg": _STALE_QUEUED_MSG,
+                        "completed_at": datetime.utcnow(),
+                    },
+                    synchronize_session=False,
+                )
+            )
+            db.commit()
+            if n == 0:
+                continue  # 已被并发写终态（恰好被 worker 取走）——尊重结果
+            reaped_q += 1
+            publish_task_event(t.id, "failed", {"error": _STALE_QUEUED_MSG})
+        if reaped_q:
+            logger.info("cleanup_stale_tasks: marked %d stale queued task(s) failed", reaped_q)
+    except Exception:  # noqa: BLE001 — 维护任务不因单次失败退出
+        db.rollback()
+        logger.exception("cleanup stale queued tasks failed")
     finally:
         db.close()
 

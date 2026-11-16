@@ -53,6 +53,20 @@ def budget_consume(
     db.commit()
 
 
+def budget_release(
+    db: Session, scope: str, tokens: int, calls: int = 1
+) -> None:
+    """回退（释放）已计入的 token 消耗。
+
+    任务在生命周期启动前就失败（预算熔断于生成前、渠道解析失败等）时，
+    已预扣的额度必须退回——否则用户为一次失败的提交白白损失额度。
+    """
+    row = _today_row(db, scope)
+    row.tokens_used = max(0, (row.tokens_used or 0) - int(tokens))
+    row.calls = max(0, (row.calls or 0) - int(calls))
+    db.commit()
+
+
 def budget_status(db: Session, scope: str) -> dict[str, int]:
     row = _today_row(db, scope)
     return {

@@ -12,14 +12,72 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Any
 
+from backend.app.models import Task
 from backend.app.services.task_queue import publish_task_event
-from backend.app.services.task_store import get_task_or_none, is_cancel_requested
+from backend.app.services.task_store import (
+    _guarded_terminal_write,
+    get_task_or_none,
+    is_cancel_requested,
+)
 
 logger = logging.getLogger("canvas.lifecycle")
 
 
 class TaskCancelledError(Exception):
     pass
+
+
+def _dt_format(dt: datetime) -> datetime:
+    """终态字段统一用 naive UTC（列类型 naive，避免 PG 报 aware/not-naive）。"""
+    return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+
+
+def _fresh_status(db, task_id: int) -> str | None:
+    """直读 DB 最新 status（绕过会话缓存），用于日志/兑底定性。"""
+    from sqlalchemy import select
+
+    with db.no_autoflush:
+        row = db.execute(select(Task.status).where(Task.id == task_id)).first()
+    return row[0] if row is not None else None
+
+
+def _write_terminal_or_keep(
+    db,
+    task,
+    error_msg: str,
+    *,
+    when: datetime | None = None,
+    duration_ms: int | None = None,
+    publish: bool = True,
+) -> bool:
+    """generating → failed 的条件写：已有终态不覆盖。返回是否写入成功。"""
+    wrote = _guarded_terminal_write(
+        db,
+        int(task.id),
+        "generating",
+        {
+            "status": "failed",
+            "phase": "failed",
+            "error_msg": str(error_msg),
+            "completed_at": _dt_format(when or datetime.utcnow()),
+            **({"duration_ms": duration_ms} if duration_ms is not None else {}),
+        },
+    )
+    if wrote:
+        task.status = "failed"
+        task.phase = "failed"
+        task.error_msg = error_msg
+        if duration_ms is not None:
+            task.duration_ms = duration_ms
+        db.commit()
+        if publish:
+            publish_task_event(int(task.id), "failed", {"error": str(error_msg)})
+    else:
+        logger.warning(
+            "task %s failed write dropped: terminal state %r kept",
+            task.id, _fresh_status(db, int(task.id)),
+        )
+    return bool(wrote)
 
 
 def _writeback_canvas_node(db, task, result: dict) -> None:
@@ -118,6 +176,8 @@ async def run_task_lifecycle(
     if task is None:
         return {"status": "failed", "error": f"task {task_id} not found"}
 
+    # 终态写保护：直接调用方（未走 claim）可能传入已终态任务——mark_started
+    # 自带终态守卫，不会复活 failed/completed
     task.mark_started()
     task.phase = "starting"
     db.commit()
@@ -132,19 +192,45 @@ async def run_task_lifecycle(
         duration_ms = int((completed_at - started_at).total_seconds() * 1000)
 
         if result.get("status") == "completed":
-            task.mark_completed(result.get("output_url") or "", when=completed_at)
-            task.duration_ms = duration_ms
-            task.cost_amount = result.get("cost_amount", estimated_cost)
-            # D3.4 LLM 计量后端化：真实 token 用量落任务行（成本看板展示 token 消耗）
+            # 终态写保护（条件 CAS）：生成期间任务可能已被并发写终态
+            # （排队超时收尸 reaper / 用户取消 / 重投的另一个 worker）。
+            # completed 不得覆盖 failed 等已有结论——争写失败时尊重现有终态。
+            _iso = _dt_format(completed_at)
             usage = result.get("usage") or {}
-            if usage.get("total_tokens"):
-                task.tokens_used = int(usage["total_tokens"])
-            # P2-9: 多图备选持久化（params JSON 列，免迁移；详情/重试可取回）
             extras = result.get("extra_urls") or []
+            fields: dict[str, Any] = {
+                "status": "completed",
+                "phase": "completed",
+                "output_url": result.get("output_url") or "",
+                "completed_at": _iso,
+                "duration_ms": duration_ms,
+                "cost_amount": result.get("cost_amount", estimated_cost),
+                "error_msg": None,
+                "cancel_requested_at": None,
+            }
+            if usage.get("total_tokens"):
+                fields["tokens_used"] = int(usage["total_tokens"])
             if extras:
                 merged = task.params_dict()
                 merged["extra_outputs"] = list(extras)
-                task.params = __import__("json").dumps(merged, ensure_ascii=False)
+                fields["params"] = __import__("json").dumps(merged, ensure_ascii=False)
+            n = _guarded_terminal_write(db, task_id, "generating", fields)
+            if n == 0:
+                _cur = _fresh_status(db, task_id)
+                logger.warning(
+                    "task %s completed result dropped: terminal state %r kept",
+                    task_id, _cur,
+                )
+                return {**result, "status": _cur or "failed", "superseded": True}
+            # 已提交的 ORM 快照同步为终态（后续 writeback/事件读同一状态）
+            task.status = "completed"
+            task.phase = "completed"
+            task.output_url = result.get("output_url") or ""
+            task.completed_at = completed_at
+            task.duration_ms = duration_ms
+            task.cost_amount = result.get("cost_amount", estimated_cost)
+            task.error_msg = None
+            task.cancel_requested_at = None
             db.commit()
             _writeback_canvas_node(db, task, result)
             _sync_prompt_thumb(db, task)
@@ -164,22 +250,23 @@ async def run_task_lifecycle(
             return result
 
         error_text = result.get("error") or "生成失败"
-        task.mark_failed(error_text, when=completed_at)
-        task.duration_ms = duration_ms
-        db.commit()
+        # 终态写保护：failed 同样不得覆盖已有终态（重投/取消竞态）
+        if not _write_terminal_or_keep(
+            db, task, error_text, when=completed_at, duration_ms=duration_ms, publish=True
+        ):
+            _writeback_canvas_node(db, task, result)
+            return {**result, "superseded": True}
         _writeback_canvas_node(db, task, result)
-        publish_task_event(task_id, "failed", {"error": str(error_text)})
         return result
 
     except TaskCancelledError as exc:
-        task.mark_failed(str(exc))
-        db.commit()
+        # 终态写保护：取消失败化不得覆盖已有终态（竞态窗口内可能已完成）
+        _write_terminal_or_keep(db, task, str(exc), publish=True)
         _writeback_canvas_node(db, task, {"status": "failed", "error": str(exc)})
-        publish_task_event(task_id, "failed", {"error": str(exc)})
         return {"status": "failed", "error": str(exc)}
 
     except asyncio.CancelledError:
-        # arq 超时击杀（job_timeout 从入队计时，排队也吃预算）≠ 用户取消
+        # arq 超时击杀（job_timeout 从 job 开始执行计时，排队不吃预算）≠ 用户取消
         # （真取消走 TaskCancelledError 分支）。按 created_at 距终态的时长区分文案，
         # 杜绝"没人取消却报已取消"的误导（2026-10-08 过载事故实证：433-435 精确
         # 1800.2s 被杀却报"任务已被取消"）。
@@ -190,15 +277,12 @@ async def run_task_lifecycle(
             _msg = f"生成超时（已运行 {_elapsed / 60:.0f} 分钟）被系统中止，请减少并发或稍后重试"
         else:
             _msg = "任务被系统中止（worker 关闭或中断），可重新提交"
-        task.mark_failed(_msg)
-        db.commit()
-        publish_task_event(task_id, "failed", {"error": _msg})
+        # 终态写保护：不覆盖并发已落的终态（收尸/取消竞态）
+        _write_terminal_or_keep(db, task, _msg, publish=True)
         raise
 
     except Exception as exc:  # noqa: BLE001 — 生命周期兜底：任何异常落库为 failed
         logger.exception("Task %s failed during lifecycle", task_id)
-        task.mark_failed(str(exc))
-        db.commit()
+        _write_terminal_or_keep(db, task, str(exc), publish=True)
         _writeback_canvas_node(db, task, {"status": "failed", "error": str(exc)})
-        publish_task_event(task_id, "failed", {"error": str(exc)})
         return {"status": "failed", "error": str(exc)}
