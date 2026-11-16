@@ -223,3 +223,152 @@ def test_stale_queued_task_reaped_but_fresh_kept(client, worker_db, db_session):
     assert old_task.status == "failed", "超时 queued 任务必须被收尸"
     assert "排队" in (old_task.error_msg or ""), old_task.error_msg
     assert fresh_task.status == "queued", "新鲜 queued 任务不得被误杀"
+
+
+# ---- 4) review 竞态修复：认领守卫 + 终态写保护 ------------------------------
+
+
+def test_claim_queued_task_atomic_single_winner(worker_db):
+    """queued→generating 认领必须原子：第二个 worker（arq 重投）看到 generating
+    直接放弃，绝不重复执行；终态/不存在同样不认领。"""
+    from backend.app.models import Task
+    from backend.app.services.task_store import claim_queued_task
+
+    factory = worker_db
+    s1, s2 = factory(), factory()
+    t = Task(user_id=1, type="image", prompt="p", model="fake-image", status="queued")
+    s1.add(t)
+    s1.commit()
+    tid = int(t.id)
+
+    # 第一个 worker 认领成功
+    assert claim_queued_task(s1, tid) == "claimed"
+    s1.refresh(t)
+    assert t.status == "generating"
+    assert t.started_at is not None
+
+    # 第二个 worker（重投）拿到同一 job：看到 generating → 放弃
+    assert claim_queued_task(s2, tid) == "generating"
+
+    # 终态任务不被认领（收尸 reaper 已标 failed 的积压 job 直接放弃）
+    s2.query(Task).filter(Task.id == tid).update(
+        {"status": "failed"}, synchronize_session=False
+    )
+    s2.commit()
+    assert claim_queued_task(s1, tid) == "failed"
+
+    # 不存在的任务
+    assert claim_queued_task(s2, 987654) is None
+    s1.close()
+    s2.close()
+
+
+def test_reaped_task_job_returns_early_without_running(client, worker_db, db_session):
+    """review 竞态：任务被 90 分钟 queued 收尸 reaper 标 failed 后，积压 job 才被
+    取到——worker 必须直接放弃：不跑 provider、不得把 failed 改写成 completed。"""
+    from backend.app.models import Task
+    from backend.worker import run_generation_task
+
+    headers = _auth_headers(client)
+    r = client.post(
+        "/api/tasks",
+        json={"type": "image", "prompt": "hello", "model": "fake-image"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    task_id = r.json()["task"]["id"]
+
+    # 模拟 reaper 抢先（另一会话条件 UPDATE queued→failed）
+    n = (
+        db_session.query(Task)
+        .filter(Task.id == task_id, Task.status == "queued")
+        .update(
+            {"status": "failed", "phase": "failed", "error_msg": "排队超时：任务长时间未被执行"},
+            synchronize_session=False,
+        )
+    )
+    db_session.commit()
+    assert n == 1
+
+    calls = {"n": 0}
+
+    async def gen(_t):  # noqa: ANN001
+        calls["n"] += 1
+        return {"status": "completed", "output_url": "/outputs/images/late.png"}
+
+    result = asyncio.run(run_generation_task({}, task_id, _gen_override=gen))
+    assert result.get("status") == "skipped", result
+    assert calls["n"] == 0, "已被收尸的任务不得再执行 provider"
+
+    db_session.expire_all()
+    t = db_session.get(Task, task_id)
+    assert t.status == "failed", "failed 终态不得被积压 job 复活"
+    assert "排队超时" in (t.error_msg or "")
+    assert t.output_url is None
+
+
+def test_completed_never_overwrites_failed(client, worker_db, db_session):
+    """review 竞态：生成进行中任务被并发写终态 failed（收尸/取消）——provider
+    成功返回 completed 也不得覆盖已有终态（条件 CAS WHERE status='generating'）。"""
+    from backend.app.models import Task
+    from backend.worker import run_generation_task
+
+    headers = _auth_headers(client)
+    r = client.post(
+        "/api/tasks",
+        json={"type": "image", "prompt": "hello", "model": "fake-image"},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    task_id = r.json()["task"]["id"]
+
+    async def gen(_t):  # noqa: ANN001
+        # 生成期间「另一进程」把任务标 failed（模拟收尸 reaper / 取消竞态）
+        n = (
+            db_session.query(Task)
+            .filter(Task.id == task_id, Task.status == "generating")
+            .update(
+                {
+                    "status": "failed",
+                    "phase": "failed",
+                    "error_msg": "生成超时：任务可能因服务重启中断，请重试",
+                },
+                synchronize_session=False,
+            )
+        )
+        db_session.commit()
+        assert n == 1
+        return {"status": "completed", "output_url": "/outputs/images/ok.png"}
+
+    result = asyncio.run(run_generation_task({}, task_id, _gen_override=gen))
+    # 结果被丢弃（superseded），落库终态保持 failed
+    assert result.get("superseded") is True or result.get("status") != "completed", result
+
+    db_session.expire_all()
+    t = db_session.get(Task, task_id)
+    assert t.status == "failed", "completed 不得覆盖 failed 终态"
+    assert "生成超时" in (t.error_msg or "")
+    assert t.output_url is None, "被否决的产物不得写入"
+
+
+def test_lifecycle_direct_terminal_task_not_revived(db_session):
+    """直调 lifecycle（未经 worker 认领）也不得复活终态任务。"""
+    from backend.app.models import Task
+    from backend.app.services.task_lifecycle import run_task_lifecycle
+
+    t = Task(user_id=1, type="image", prompt="p", model="fake-image", status="failed",
+             error_msg="排队超时：任务长时间未被执行")
+    db_session.add(t)
+    db_session.commit()
+    tid = int(t.id)
+
+    async def gen(_t):  # noqa: ANN001
+        return {"status": "completed", "output_url": "/x.png"}
+
+    result = asyncio.run(run_task_lifecycle(db_session, tid, gen))
+    assert result.get("superseded") is True or result.get("status") != "completed"
+    db_session.expire_all()
+    t2 = db_session.get(Task, tid)
+    assert t2.status == "failed"
+    assert "排队超时" in (t2.error_msg or "")
+    assert t2.output_url is None

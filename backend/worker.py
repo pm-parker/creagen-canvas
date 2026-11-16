@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import logging
 import os
+from datetime import datetime
 from typing import Any
 
 from arq import cron
@@ -27,7 +28,19 @@ from backend.app.services.task_queue import (
     publish_task_event,
     redis_settings_from_url,
 )
-from backend.app.services.task_store import get_task_or_none
+from backend.app.services.task_store import (
+    TERMINAL_TASK_STATUSES,
+    _fresh_cancel_state,
+    _guarded_terminal_write,
+    get_task_or_none,
+)
+
+
+def _fresh_task_status(db, task_id: int) -> str | None:
+    """直读 DB 最新 status（绕过会话缓存）：worker 会话 expire_on_commit=False。"""
+    status, _cancel_at = _fresh_cancel_state(db, task_id)
+    return status
+
 
 logger = logging.getLogger("canvas.worker")
 
@@ -53,12 +66,24 @@ async def _fail_before_lifecycle(db, task_id: int, exc: Exception) -> dict[str, 
     marked = False
     try:
         task = get_task_or_none(db, task_id)
-        if task is not None and task.status in {"queued", "generating"}:
-            task.mark_failed(error_msg)
-            db.commit()
-            marked = True
+        # 终态写保护（条件 CAS）：仅当任务仍非终态时才落 failed——被收尸 reaper
+        # /取消并发先写终态的，尊重既有结论不覆盖（rowcount=0 → 不发终态事件）
+        fresh_status = _fresh_task_status(db, task_id)
+        if task is not None and fresh_status not in TERMINAL_TASK_STATUSES:
+            marked = bool(
+                _guarded_terminal_write(
+                    db,
+                    task_id,
+                    fresh_status or "",
+                    {
+                        "status": "failed",
+                        "phase": "failed",
+                        "error_msg": error_msg,
+                        "completed_at": datetime.utcnow(),
+                    },
+                )
+            )
         else:
-            # 任务不存在 / 已终态（arq 重投或取消竞态）：尊重既有终态不覆盖
             db.rollback()
     except Exception:  # noqa: BLE001 — 落库失败不掩盖原始错误
         db.rollback()
@@ -101,23 +126,42 @@ async def run_generation_task(
 
     _gen_override 仅测试注入（跳过 provider 解析直接给生成函数）。
     """
-    from backend.app.core.config import get_settings as _gs
+    from backend.app.services.task_store import claim_queued_task
 
     db = get_session_factory()()
     _budget_state: dict[str, Any] | None = None
     _lifecycle_started = False
     try:
+        # 入口认领守卫（review 竞态修复）：job 可能是压仓积压——取到时任务已被
+        # queued 收尸 reaper 标 failed、被另一 worker（arq 重投）抢先执行、或已
+        # 终态。先直读 DB 最新状态，非 queued 直接放弃（绝不复活终态、不重复
+        # 生成）；仍 queued 则条件 UPDATE 原子抢占 queued→generating（两 worker
+        # 同时认领只有一个成功）。
+        claimed = claim_queued_task(db, task_id)
+        if claimed != "claimed":
+            logger.warning(
+                "task %s skipped at job entry: current status=%r (claimed by other "
+                "worker / reaped / terminal)",
+                task_id, claimed,
+            )
+            return {
+                "status": "skipped",
+                "task_status": claimed or "missing",
+                "error": f"task no longer queued (status={claimed or 'missing'})",
+            }
+
         task = get_task_or_none(db, task_id)
         if task is None:
             logger.error("Task %s not found", task_id)
             return {"status": "failed", "error": "task not found"}
 
+        task_params = task.params_dict()
+        channel_id = task_params.get("channel_id")
+
         from backend.app.core.config import get_settings as _gs
         from backend.app.core.errors import ProviderNotConfiguredError
         from backend.app.services.provider_service import resolve_provider_for_task
 
-        task_params = task.params_dict()
-        channel_id = task_params.get("channel_id")
         # 配置价优先，内置建议价回落（spec §5.2）；含 channel_id 才能同名模型按渠道精确计价
         estimated_cost = resolve_cost(
             db, task.type, task.model, task_params, channel_id=channel_id, prompt=task.prompt
@@ -139,6 +183,8 @@ async def run_generation_task(
             )
             # 局部重绘：渠道必须显式开启 edit 能力（开放架构——支持 /images/edits 的渠道自行勾选）。
             # 注意：此处位于 task_lifecycle 之前，失败必须直接落库（抛异常会让任务卡 queued）。
+            # 终态写保护（条件 CAS）：任务已被认领为 generating，但若期间被并发
+            # 写终态（取消/收尸），这里不得覆盖——争写失败即放弃。
             if task.type == "image" and task_params.get("mode") == "edit":
                 caps = _channel._capabilities_list() if _channel is not None else []
                 if "edit" not in caps and "edit_ref" not in caps:
@@ -146,11 +192,21 @@ async def run_generation_task(
                         "当前渠道未开启图像编辑能力。请在「模型渠道」编辑该渠道并勾选"
                         "「支持图像编辑」或「支持参考图编辑」，或更换支持的渠道。"
                     )
-                    task.status = "failed"
-                    task.error_msg = msg
-                    db.commit()
-                    # 直接落库路径也必须发布终态事件：否则 SSE 订阅者永远收不到，
-                    # 前端节点卡"生成中"（教训⑨配套）
+                    if not _guarded_terminal_write(
+                        db,
+                        task_id,
+                        "generating",
+                        {
+                            "status": "failed",
+                            "phase": "failed",
+                            "error_msg": msg,
+                            "completed_at": datetime.utcnow(),
+                        },
+                    ):
+                        logger.warning(
+                            "task %s edit capability missing but terminal state kept", task_id
+                        )
+                        return {"status": "failed", "error": msg, "superseded": True}
                     publish_task_event(task_id, "failed", {"error": msg})
                     logger.warning("task %s edit capability missing", task_id)
                     return {"status": "failed", "error": msg}
@@ -256,9 +312,19 @@ async def run_generation_task(
 
             if not await acquire_video_gate(_gate_redis, _gate_ch, limit=_gate_limit):
                 msg = "视频排队超时（渠道并发闸门），请稍后重试或错峰提交"
-                task.status = "failed"
-                task.error_msg = msg
-                db.commit()
+                # 终态写保护：并发已写终态则不覆盖（与 lifecycle 同口径）
+                if not _guarded_terminal_write(
+                    db,
+                    task_id,
+                    "generating",
+                    {
+                        "status": "failed",
+                        "phase": "failed",
+                        "error_msg": msg,
+                        "completed_at": datetime.utcnow(),
+                    },
+                ):
+                    return {"status": "failed", "error": msg, "superseded": True}
                 publish_task_event(task_id, "failed", {"error": msg})
                 return {"status": "failed", "error": msg}
             _gate_held = True

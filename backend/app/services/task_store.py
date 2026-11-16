@@ -104,6 +104,64 @@ def _fresh_cancel_state(db: Session, task_id: int) -> tuple[str | None, object]:
     return row[0], row[1]
 
 
+TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "cancelled"})
+
+
+def _guarded_terminal_write(
+    db: Session,
+    task_id: int,
+    expected_status: str,
+    fields: dict[str, Any],
+) -> int:
+    """条件 UPDATE 写终态：仅当 status 仍为 expected 时生效，返回受影响行数。
+
+    终态一旦落库（failed/completed/cancelled）就是权威结论，任何晚到的并发写
+    （收尸 reaper、取消、另一个 worker 的回写）都不得覆盖它。WHERE 带原状态
+    的条件 UPDATE + rowcount 检查即数据库层的 CAS。
+    """
+    n = (
+        db.query(Task)
+        .filter(Task.id == task_id, Task.status == expected_status)
+        .update(fields, synchronize_session=False)
+    )
+    db.commit()
+    return int(n)
+
+
+def claim_queued_task(db: Session, task_id: int) -> str | None:
+    """作业入口守卫：queued → generating 的原子认领。
+
+    worker 从队列取到 job 时，任务可能已被并发改写—— queued 收尸 reaper 标成
+    failed、另一个 worker（arq 重投）抢先执行、或任务不存在。这里先直读 DB
+    最新状态（不用会话缓存），非 queued 直接返回该状态让调用方放弃；仍为
+    queued 则用条件 UPDATE 抢占（两 worker 同时认领只有一个成功）。
+    先 commit 清空本会话事务，保证读到的是其他进程已提交的最新快照。
+    """
+    db.commit()  # 结束旧事务：确保下面的 SELECT 取到最新已提交快照
+    fresh_status, _cancel_at = _fresh_cancel_state(db, task_id)
+    if fresh_status != "queued":
+        return fresh_status  # None=不存在；其余为已认领/终态——一律不执行
+    from datetime import datetime
+
+    now = datetime.utcnow()
+    n = _guarded_terminal_write(
+        db,
+        task_id,
+        "queued",
+        {"status": "generating", "started_at": now, "worker_heartbeat_at": now},
+    )
+    if n == 0:
+        # 认领窗口内被并发改写（reaper 失败化 / 另一 worker 认领）——重读定性
+        db.rollback()
+        fresh_status, _ = _fresh_cancel_state(db, task_id)
+        return fresh_status if fresh_status is not None else "gone"
+    # 本会话 identity map 里的 Task 同步为已认领状态（后续 ORM 写基于同一行）
+    task = get_task_or_none(db, task_id)
+    if task is not None:
+        db.refresh(task)
+    return "claimed"
+
+
 def mark_cancel_requested(db: Session, task_id: int) -> bool:
     from datetime import datetime
 
