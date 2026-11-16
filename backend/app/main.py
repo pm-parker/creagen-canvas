@@ -146,7 +146,14 @@ def create_app() -> FastAPI:
                 from starlette.responses import Response
 
                 full = outputs_dir / path
-                if not full.is_file():
+                # P2 安全：raw path 可能携带 ../、编码 %2e%2e%2f 或反斜杠等穿越段，
+                # 解析后必须仍位于 outputs 目录内，否则一律回落原文件响应（即 404），
+                # 绝不经 Pillow 打开目录外文件（含符号链接目标）。
+                try:
+                    inside = full.resolve().is_relative_to(outputs_dir.resolve())
+                except (OSError, RuntimeError, ValueError):
+                    inside = False
+                if not inside or not full.is_file():
                     return await super().get_response(path, scope)
 
                 try:
