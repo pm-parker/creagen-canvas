@@ -40,29 +40,39 @@ openssl rand -hex 32   # 分别用于 JWT_SECRET 与 ENCRYPTION_KEY
    docker compose exec db pg_dump -U creagen creagen > backup-$(date +%F).sql
    ```
 
-2. **试运行**（只统计，不写库）：确认 `undecryptable=0`，`to_reencrypt` 数量符合预期。
+2. **停掉 api 与 worker**（重加密期间服务必须下线，避免新旧密文混写；db / redis 保留运行）：
+
+   ```bash
+   docker compose stop api worker
+   ```
+
+3. **试运行**（只统计，不写库）：确认 `undecryptable=0`，`to_reencrypt` 数量符合预期。
+   密钥一律经环境变量 `OLD_ENCRYPTION_KEY` / `ENCRYPTION_KEY` 传入，**不要用
+   `--old-key` / `--new-key` 命令行参数**——命令行会留在 shell 历史并出现在 `ps` 输出里。
    宿主机直跑（推荐，需能连通目标库）：
 
    ```bash
-   OLD=$(grep '^ENCRYPTION_KEY=' .env | cut -d= -f2-)   # 旧值
-   NEW=$(openssl rand -hex 32)                          # 新值（先只生成，别急着写进 .env）
-   DATABASE_URL='<指向目标库的连接串>' \
-     python -m scripts.reencrypt_channel_keys --old-key "$OLD" --new-key "$NEW" --dry-run
+   export OLD_ENCRYPTION_KEY="$(grep '^ENCRYPTION_KEY=' .env | cut -d= -f2-)"  # 旧值
+   export ENCRYPTION_KEY="$(openssl rand -hex 32)"                        # 新值（先只生成，别急着写进 .env）
+   DATABASE_URL='<指向目标库的连接串>' python -m scripts.reencrypt_channel_keys --dry-run
    ```
 
    或在 compose 容器里跑（需给 migrate 服务临时加挂载 `- ./scripts:/app/scripts:ro`，
-   且因其 entrypoint 固定为 `sh -c "alembic upgrade head"`，必须用 `--entrypoint` 覆盖）：
+   且因其 entrypoint 固定为 `sh -c "alembic upgrade head"`，必须用 `--entrypoint` 覆盖；
+   `-e VAR` 不带值即透传宿主机同名环境变量）：
 
    ```bash
    docker compose run --rm --entrypoint python \
-     -e OLD_ENCRYPTION_KEY="$OLD" -e ENCRYPTION_KEY="$NEW" \
+     -e OLD_ENCRYPTION_KEY -e ENCRYPTION_KEY \
      migrate -m scripts.reencrypt_channel_keys --dry-run
    ```
 
-3. **正式重加密**（单一事务：任何一行新旧密钥都解不开即整体回滚、非零退出，
-   成功后重跑为幂等 no-op）——与第 2 步同一命令，去掉 `--dry-run`。
+4. **正式重加密**（单一事务：任何一行新旧密钥都解不开即整体回滚、非零退出，
+   成功后重跑为幂等 no-op）——与第 3 步同一命令（环境变量传密钥），去掉 `--dry-run`。
 
-4. 把 `.env` 的 `ENCRYPTION_KEY` 换成第 2 步生成的 `$NEW` 并重启：`docker compose up -d`。
+5. 把 `.env` 的 `ENCRYPTION_KEY` 换成第 3 步生成的 `$ENCRYPTION_KEY`，
+   `unset OLD_ENCRYPTION_KEY ENCRYPTION_KEY`（用完即清），再重启：
+   `docker compose up -d`（api / worker 随之恢复运行）。
    验证：任一已配置渠道能正常发起生成任务（说明旧密文已可被新密钥解密）。
 
 脚本输出只含计数（`to_reencrypt` / `already_new` / `undecryptable`），不会打印任何

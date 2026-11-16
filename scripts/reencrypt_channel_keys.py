@@ -1,11 +1,13 @@
 """ENCRYPTION_KEY 轮换：把库里已加密的渠道密钥从旧密钥重加密到新密钥。
 
-用法（二选一）::
+用法（推荐用环境变量传密钥；命令行参数会留在 shell 历史并出现在 `ps` 输出里）::
 
-    python -m scripts.reencrypt_channel_keys --old-key <旧值> --new-key <新值> --dry-run
-    python scripts/reencrypt_channel_keys.py --old-key <旧值> --new-key <新值>
+    export OLD_ENCRYPTION_KEY=<旧值> ENCRYPTION_KEY=<新值>
+    python -m scripts.reencrypt_channel_keys --dry-run
+    unset OLD_ENCRYPTION_KEY ENCRYPTION_KEY
 
-密钥来源：--old-key / --new-key，缺省回落环境变量 OLD_ENCRYPTION_KEY / ENCRYPTION_KEY。
+密钥来源：环境变量 OLD_ENCRYPTION_KEY / ENCRYPTION_KEY（推荐），
+或 --old-key / --new-key（不推荐，会进 shell 历史/ps）。
 数据库连接：环境变量 DATABASE_URL，缺省回落应用 Settings（.env）。
 
 行为（真实运行在【单一事务】内完成，任一行无法解密即整体回滚）：
