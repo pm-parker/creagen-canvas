@@ -5,35 +5,37 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   lint-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.12"
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
         with:
           enable-cache: true
 
       - name: Install dependencies
-        run: |
-          uv venv
-          uv pip install \
-            "fastapi>=0.115" "uvicorn[standard]>=0.30" "httpx>=0.27" "arq>=0.26" \
-            "alembic>=1.13" "python-jose[cryptography]>=3.3" "bcrypt" \
-            "python-multipart>=0.0.9" "psycopg[binary]>=3.2" "redis>=5.0" \
-            "sqlalchemy>=2.0" "pillow>=12.2" "pydantic-settings" "cryptography" \
-            pytest "types-python-jose" ruff mypy
+        run: uv sync --frozen --python 3.12
 
       - name: Lint (ruff)
         run: uv run ruff check .
 
       - name: Type check (mypy)
         run: uv run mypy backend
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
 
       - name: Unit tests
         run: uv run pytest -q -m "not integration"
@@ -66,3 +68,38 @@ jobs:
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 5s --health-timeout 3s --health-retries 10
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115  # v6.1.1
+        with:
+          version: 12
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck (tsc)
+        run: pnpm exec tsc -b --noEmit
+
+      - name: Lint (oxlint)
+        run: pnpm lint
+
+      - name: Unit tests (vitest)
+        run: npx vitest run
+
+      - name: Build
+        run: pnpm build

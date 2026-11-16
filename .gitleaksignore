@@ -1,0 +1,12 @@
+# 测试用假密钥，非真实凭据
+e58a35281d8737cf92de0a0a6355a4e07020e4f4:.github/workflows/ci.yml:generic-api-key:46
+e58a35281d8737cf92de0a0a6355a4e07020e4f4:.github/workflows/ci.yml:generic-api-key:47
+e58a35281d8737cf92de0a0a6355a4e07020e4f4:backend/tests/conftest.py:generic-api-key:54
+e58a35281d8737cf92de0a0a6355a4e07020e4f4:backend/tests/conftest.py:generic-api-key:55
+e58a35281d8737cf92de0a0a6355a4e07020e4f4:backend/tests/test_providers_impl.py:generic-api-key:13
+e58a35281d8737cf92de0a0a6355a4e07020e4f4:backend/tests/test_providers.py:generic-api-key:14
+e58a35281d8737cf92de0a0a6355a4e07020e4f4:scripts/acceptance-w1.sh:generic-api-key:35
+# 测试用假密钥（PR #4 ci.yml / PR #7 集成测试兜底值），非真实凭据
+335964a4c9b5de53a2dd37af0b96cd8c5ad8d962:backend/tests/test_migration_snapshots_integration.py:generic-api-key:76
+335964a4c9b5de53a2dd37af0b96cd8c5ad8d962:backend/tests/test_migration_snapshots_integration.py:generic-api-key:77
+2ffc08ed79ebc18d06b94c9bf48fc256aee1851d:.github/workflows/ci.yml:generic-api-key:46

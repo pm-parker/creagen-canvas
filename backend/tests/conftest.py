@@ -44,13 +44,19 @@ def fake_arq_pool(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def test_env(monkeypatch):
+def test_env(monkeypatch, request):
     """每个测试的确定性环境；必填变量齐全，缺变量场景由测试自己 delenv。
-    REDIS_URL 尊重外部传入（integration 跑真实 Redis 时用 -m integration + 环境变量指向）。"""
+    REDIS_URL：仅 integration 标记的用例尊重外部传入（-m integration + 环境变量指向真实 Redis）；
+    其余单测一律指向不可达地址，防止宿主机/CI services 里恰好有 Redis 时单测连上真实
+    Redis（共享 pub/sub、限流、SSE 状态）导致互相串扰甚至挂死。"""
     import os
 
+    if request.node.get_closest_marker("integration") is None:
+        redis_url = "redis://127.0.0.1:1/0"
+    else:
+        redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
     monkeypatch.setenv("DATABASE_URL", "sqlite://")
-    monkeypatch.setenv("REDIS_URL", os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
+    monkeypatch.setenv("REDIS_URL", redis_url)
     monkeypatch.setenv("JWT_SECRET", "test-jwt-secret-0123456789abcdef")
     monkeypatch.setenv("ENCRYPTION_KEY", "test-encryption-key-0123456789abcdef")
     monkeypatch.setenv("REGISTER_MODE", "invite")

@@ -1,5 +1,23 @@
 """SPA 托管契约（Review Focus #1）：深链回落 + 资源/命名空间不误回落。"""
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def spa_static_dir(monkeypatch, tmp_path):
+    """测试不依赖已构建前端：临时 static 目录 + 最小 index.html，指给 SPA 回落。"""
+    import backend.app.main as main_mod
+
+    static = tmp_path / "static"
+    (static / "assets").mkdir(parents=True)
+    (static / "assets" / "app.js").write_text("// test asset", encoding="utf-8")
+    (static / "index.html").write_text(
+        "<!doctype html><html><body>creagen-test-spa</body></html>", encoding="utf-8"
+    )
+    # autouse 先于 client fixture 执行，create_app() 注册 SPA 回落时读取该目录
+    monkeypatch.setattr(main_mod, "_STATIC_DIR", static)
+    return static
+
 
 def test_spa_deep_link_returns_index(client):
     r = client.get("/canvas/5")
