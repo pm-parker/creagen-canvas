@@ -1,6 +1,6 @@
 """渠道密钥 AES-GCM 加密。
 
-ENCRYPTION_KEY（任意 >=16 字符字符串）经 SHA-256 派生 32 字节 AES-256 密钥。
+ENCRYPTION_KEY（>=32 字符且非占位值，见 config.py 的启动校验）经 SHA-256 派生 32 字节 AES-256 密钥。
 token 格式：`v1:<urlsafe-b64(2B version || 12B nonce || ciphertext)>`，版本前缀支持未来轮换。
 """
 
