@@ -118,16 +118,22 @@ class ChangePasswordRequest(BaseModel):
     new_password: str
 
 
-@router.post("/change-password")
+@router.post("/change-password", response_model=TokenResponse)
 def change_password(
     body: ChangePasswordRequest,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
-) -> dict:
-    """修改密码：验证旧密码后更新。"""
+) -> TokenResponse:
+    """修改密码：验证旧密码后更新。
+
+    - 旧密码错误返回 400（WRONG_PASSWORD）而非 401：401 会被前端全局拦截器
+      当成「登录过期」从而把用户踢出登录态。
+    - 成功后 token_version +1 使旧 token 立即失效（安全属性保留），
+      同时签发新 token 返回，调用方据此续期当前会话。
+    """
     if not user.verify_password(body.old_password):
         raise HTTPException(
-            status_code=401, detail={"code": "OLD_PASSWORD_WRONG", "message": "旧密码不正确"}
+            status_code=400, detail={"code": "WRONG_PASSWORD", "message": "原密码错误"}
         )
     if len(body.new_password) < 8:
         raise HTTPException(
@@ -136,7 +142,9 @@ def change_password(
     user.set_password(body.new_password)
     user.token_version = int(user.token_version or 0) + 1  # noqa: E501 — ORM 假阳性已由 pyproject overrides 覆盖
     db.commit()
-    return {"changed": True}
+    # 重新取一次，确保签发的 token 带最新 token_version
+    fresh = db.get(User, user.id) or user
+    return TokenResponse(access_token=create_access_token(fresh))
 
 
 @router.post("/tour-completed")

@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { useNavigate, useParams } from "react-router";
+import { useLocation, useNavigate, useParams } from "react-router";
 import { useQuery } from "@tanstack/react-query";
 import { Copy, Hexagon, Loader2, Lock } from "lucide-react";
 import {
@@ -39,6 +39,7 @@ const nodeTypes = { canvas: CanvasNode };
 export function SharePage() {
   const { token = "" } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
   const user = useAuthStore((s) => s.user);
   const isLoggedIn = !!user;
   const [forking, setForking] = useState(false);
@@ -86,7 +87,8 @@ export function SharePage() {
   async function fork() {
     if (forking) return;
     if (!isLoggedIn) {
-      navigate(`/login?next=/share/${token}`);
+      const next = `${location.pathname}${location.search}`;
+      navigate(`/login?next=${encodeURIComponent(next)}`);
       return;
     }
     setForking(true);

@@ -27,13 +27,14 @@ const queryClient = new QueryClient({
   defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
 });
 
-/** 401 统一跳登录（登录页自身除外，防循环）。 */
+/** 401 统一跳登录（登录页自身除外，防循环）；携带当前路径供登录后回跳。 */
 function UnauthorizedBridge() {
   const navigate = useNavigate();
   useEffect(() => {
     setUnauthorizedHandler(() => {
       if (!window.location.pathname.startsWith("/login")) {
-        navigate("/login", { replace: true });
+        const next = `${window.location.pathname}${window.location.search}`;
+        navigate(`/login?next=${encodeURIComponent(next)}`, { replace: true });
       }
     });
     return () => setUnauthorizedHandler(null);

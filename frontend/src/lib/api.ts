@@ -22,6 +22,17 @@ export function setUnauthorizedHandler(handler: UnauthorizedHandler | null) {
   unauthorizedHandler = handler;
 }
 
+/** 401 不触发「登录过期」处理的路由：
+ * - /api/auth/login：密码错误返回 401 是业务错误，由登录页展示
+ *   「用户名或密码错误」，不能当作会话过期去清 token / 跳登录。
+ * - /api/auth/change-password：已改为 400（不在此列），但历史版本返回
+ *   401，同样不应踢会话，双保险豁免。 */
+const NO_SESSION_EXPIRE_PATHS = ["/api/auth/login", "/api/auth/change-password"];
+
+function isSessionExpireExempt(path: string): boolean {
+  return NO_SESSION_EXPIRE_PATHS.includes(path);
+}
+
 interface ApiFetchOptions extends Omit<RequestInit, "body"> {
   json?: unknown;
 }
@@ -42,7 +53,7 @@ export async function apiFetch<T = unknown>(path: string, opts: ApiFetchOptions 
 
   const resp = await fetch(path, init);
 
-  if (resp.status === 401) {
+  if (resp.status === 401 && !isSessionExpireExempt(path)) {
     useAuthStore.getState().logout();
     unauthorizedHandler?.();
     throw new ApiError("AUTH_REQUIRED", "登录已过期，请重新登录", "", 401);

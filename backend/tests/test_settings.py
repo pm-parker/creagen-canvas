@@ -130,6 +130,60 @@ class TestJwtRevocation:
         r = client.get("/api/assets", headers={"Authorization": f"Bearer {new_token}"})
         assert r.status_code == 200
 
+    def test_change_password_returns_new_token_and_revokes_old(self, client, db_session):
+        """PR7: 改密码成功 → 返回新 token（同登录 TokenResponse 形状）；
+        新 token 可访问 /me，旧 token 立即失效。"""
+        headers = _register(client, REGISTER_USER)
+        old_token = headers["Authorization"].split(" ", 1)[1]
+
+        r = client.post(
+            "/api/auth/change-password",
+            json={"old_password": REGISTER_USER["password"], "new_password": "newpassword456"},
+            headers=headers,
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["token_type"] == "bearer"
+        new_token = body["access_token"]
+        assert isinstance(new_token, str) and new_token
+        assert new_token != old_token
+
+        # 新 token 可访问 /me
+        r = client.get("/api/auth/me", headers={"Authorization": f"Bearer {new_token}"})
+        assert r.status_code == 200, r.text
+        assert r.json()["username"] == REGISTER_USER["username"]
+
+        # 旧 token 被拒（凭据已失效）
+        r = client.get("/api/auth/me", headers={"Authorization": f"Bearer {old_token}"})
+        assert r.status_code == 401
+
+    def test_change_password_wrong_old_password_400_and_token_kept(self, client, db_session):
+        """PR7: 旧密码错误 → 400 WRONG_PASSWORD（不再 401 踢登录态），
+        且当前 token 仍有效。"""
+        headers = _register(client, REGISTER_USER)
+        token = headers["Authorization"].split(" ", 1)[1]
+
+        r = client.post(
+            "/api/auth/change-password",
+            json={"old_password": "definitely-wrong", "new_password": "newpassword456"},
+            headers=headers,
+        )
+        assert r.status_code == 400, r.text
+        detail = r.json()["detail"]
+        assert detail["code"] == "WRONG_PASSWORD"
+        assert detail["message"] == "原密码错误"
+
+        # 当前 token 未被撤销，会话不受影响
+        r = client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"})
+        assert r.status_code == 200, r.text
+
+        # 密码未变：仍可用原密码登录
+        r = client.post(
+            "/api/auth/login",
+            json={"identifier": REGISTER_USER["username"], "password": REGISTER_USER["password"]},
+        )
+        assert r.status_code == 200
+
     def test_forged_version_rejected(self, client, db_session):
         """伪造低版本 ver 的 token 被拒（防降级重放）。"""
         import jwt as pyjwt
