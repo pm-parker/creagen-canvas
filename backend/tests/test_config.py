@@ -29,7 +29,7 @@ def test_validation_error_does_not_leak_secret(monkeypatch):
     from pydantic import ValidationError
 
     leaked = "leaky-s3cret"
-    assert len(leaked) < 16
+    assert len(leaked) < 32
     monkeypatch.setenv("JWT_SECRET", leaked)
     monkeypatch.setenv("ENCRYPTION_KEY", "e" * 64)
     monkeypatch.chdir("/tmp")
@@ -80,15 +80,17 @@ def test_explicit_fake_provider_on(monkeypatch):
 
 
 class TestSecretValidation:
-    """密钥校验：<16 拒绝；16~31 或占位值仅告警；强随机值无告警（round 2 放宽）。"""
+    """密钥校验（用户最终决定）：<32 或占位值一律拒绝启动，无告警放行路径。"""
 
     @pytest.mark.parametrize("var", ["JWT_SECRET", "ENCRYPTION_KEY"])
     @pytest.mark.parametrize(
         "bad",
         [
             "",  # 空
-            "short-secret-1",  # < 16 字符
-            "c" * 15,  # 差一位
+            "short-secret-1",  # 过短
+            "c" * 15,  # 差一位到旧下限
+            "s" * 16,  # 旧规则放行的长度，现在必须拒绝
+            "c" * 31,  # 差一位到 32
         ],
     )
     def test_rejects_too_short_secrets(self, monkeypatch, var, bad):
@@ -105,7 +107,7 @@ class TestSecretValidation:
     def test_error_message_is_actionable(self, monkeypatch):
         from pydantic import ValidationError
 
-        monkeypatch.setenv("JWT_SECRET", "too-short")
+        monkeypatch.setenv("JWT_SECRET", "c" * 31)
         monkeypatch.setenv("ENCRYPTION_KEY", "e" * 64)
         monkeypatch.chdir("/tmp")
 
@@ -113,28 +115,6 @@ class TestSecretValidation:
             _make_settings()
         assert "JWT_SECRET" in str(ei.value)
         assert "openssl rand -hex 32" in str(ei.value)
-
-    @pytest.mark.parametrize("var", ["JWT_SECRET", "ENCRYPTION_KEY"])
-    @pytest.mark.parametrize(
-        "short",
-        [
-            "s" * 16,  # 刚好达标下限，但低于推荐值
-            "c" * 31,  # 差一位到 32
-        ],
-    )
-    def test_short_but_valid_secrets_warn(self, monkeypatch, caplog, var, short):
-        """16~31 字符：不拦截，但启动时打 WARNING（存量部署兼容）。"""
-        monkeypatch.setenv("JWT_SECRET", "j" * 64)
-        monkeypatch.setenv("ENCRYPTION_KEY", "e" * 64)
-        monkeypatch.setenv(var, short)
-        monkeypatch.chdir("/tmp")
-
-        with caplog.at_level("WARNING", logger="creagen.config"):
-            s = _make_settings()
-        assert getattr(s, "jwt_secret" if var == "JWT_SECRET" else "encryption_key") == short
-        assert any(var in r.message and "openssl rand -hex 32" in r.message for r in caplog.records)
-        # 消息里不得回显密钥本身
-        assert not any(short in r.message for r in caplog.records)
 
     @pytest.mark.parametrize(
         ("var", "placeholder"),
@@ -149,43 +129,60 @@ class TestSecretValidation:
             ("ENCRYPTION_KEY", "placeholder-secret-change-me-please-generate-a-random-64-hex"),
         ],
     )
-    def test_placeholder_secrets_warn_but_accepted(self, monkeypatch, caplog, var, placeholder):
-        """占位值：不拦截，仅 WARNING（round 2：存量部署保持可启动）。"""
+    def test_rejects_placeholder_secrets(self, monkeypatch, var, placeholder):
+        """占位特征命中即拒绝启动（round 2 的告警放行已被用户最终决定否决）。"""
+        from pydantic import ValidationError
+
         monkeypatch.setenv("JWT_SECRET", "j" * 64)
         monkeypatch.setenv("ENCRYPTION_KEY", "e" * 64)
         monkeypatch.setenv(var, placeholder)
         monkeypatch.chdir("/tmp")
 
-        with caplog.at_level("WARNING", logger="creagen.config"):
-            s = _make_settings()
-        assert getattr(s, "jwt_secret" if var == "JWT_SECRET" else "encryption_key") == placeholder
-        assert any(var in r.message and "openssl rand -hex 32" in r.message for r in caplog.records)
-        assert not any(placeholder in r.message for r in caplog.records)
+        with pytest.raises(ValidationError, match=var) as ei:
+            _make_settings()
+        # 报错绝不回显密钥本身
+        assert placeholder not in str(ei.value)
+        assert placeholder not in repr(ei.value)
 
-    def test_encryption_key_warning_mentions_rotation_cost(self, monkeypatch, caplog):
-        """ENCRYPTION_KEY 告警需提示轮换会使已存渠道密钥不可解密。"""
-        monkeypatch.setenv("JWT_SECRET", "j" * 64)
-        monkeypatch.setenv("ENCRYPTION_KEY", "please-change-me-insecure-64")
+    def test_error_does_not_echo_value(self, monkeypatch):
+        """过短密钥的报错不得回显值本身（hide_input_in_errors + 消息文案双保险）。"""
+        from pydantic import ValidationError
+
+        leaked = "c" * 31
+        monkeypatch.setenv("JWT_SECRET", leaked)
+        monkeypatch.setenv("ENCRYPTION_KEY", "e" * 64)
         monkeypatch.chdir("/tmp")
 
-        with caplog.at_level("WARNING", logger="creagen.config"):
+        with pytest.raises(ValidationError, match="JWT_SECRET") as ei:
             _make_settings()
-        msgs = [r.message for r in caplog.records]
-        assert any("ENCRYPTION_KEY" in m and "解密" in m for m in msgs)
-        # JWT_SECRET 的告警不应带渠道密钥轮换提示
-        assert not any("JWT_SECRET" in m and "渠道密钥无法解密" in m for m in msgs)
+        assert leaked not in str(ei.value)
+        assert leaked not in repr(ei.value)
 
-    def test_accepts_random_hex_secrets(self, monkeypatch, caplog):
+    @pytest.mark.parametrize("good", ["a" * 64, "0123456789abcdef" * 4])
+    def test_accepts_random_hex_secrets(self, monkeypatch, caplog, good):
         """64 位 hex 强随机值：通过且无任何 WARNING。"""
-        monkeypatch.setenv("JWT_SECRET", "a" * 64)
+        monkeypatch.setenv("JWT_SECRET", good)
         monkeypatch.setenv("ENCRYPTION_KEY", "b" * 64)
         monkeypatch.chdir("/tmp")
 
         with caplog.at_level("WARNING", logger="creagen.config"):
             s = _make_settings()
-        assert s.jwt_secret == "a" * 64
+        assert s.jwt_secret == good
         assert s.encryption_key == "b" * 64
         assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+    def test_min_length_boundary_accepted(self, monkeypatch):
+        """刚好 32 字符（非占位值）：通过——下限是 32，不是 33。"""
+        monkeypatch.setenv("JWT_SECRET", "s" * 32)
+        monkeypatch.setenv("ENCRYPTION_KEY", "k" * 32)
+        monkeypatch.chdir("/tmp")
+
+        s = _make_settings()
+        assert len(s.jwt_secret) == 32
+        assert len(s.encryption_key) == 32
+
+
+# ---------- pr4：ENCRYPTION_KEY 轮换脚本（scripts/reencrypt_channel_keys.py） ----------
 
 
 class TestNoDefaultInviteCode:
