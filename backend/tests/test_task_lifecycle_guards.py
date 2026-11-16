@@ -315,11 +315,14 @@ def test_claim_queued_task_atomic_single_winner(worker_db):
     s1.commit()
     tid = int(t.id)
 
-    # 第一个 worker 认领成功
+    # 第一个 worker 认领成功（只占坑不计时：started_at 留给生成真正开始，
+    # 否则闸门排队会被 30 分钟收尸误杀）
     assert claim_queued_task(s1, tid) == "claimed"
     s1.refresh(t)
     assert t.status == "generating"
-    assert t.started_at is not None
+    assert t.phase == "waiting_gate"
+    assert t.started_at is None
+    assert t.worker_heartbeat_at is not None
 
     # 第二个 worker（重投）拿到同一 job：看到 generating → 放弃
     assert claim_queued_task(s2, tid) == "generating"

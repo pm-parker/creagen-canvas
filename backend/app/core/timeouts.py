@@ -8,7 +8,7 @@
 散落 4 文件靠注释互指，改一处忘其他即破序）。
 """
 
-# arq：从入队计时（排队也吃预算）——60 分钟
+# arq：从 job 开始执行计时（不是从入队计时——排队不吃预算）——60 分钟
 ARQ_JOB_TIMEOUT_S = 3600
 
 # 视频渠道闸门：排队上限（< arq，闸门先于 arq 放弃并给出明确文案）
@@ -26,7 +26,7 @@ CLEANUP_STALE_MIN = 30
 
 # queued 收尸阈值（入队即计时，含排队 + 生成全链路）：必须 > ARQ_JOB_TIMEOUT_S，
 # 否则会把仍在排队预算内的正常任务误杀。独立成常量：queued 生命周期比
-# generating 长（arq 从入队计时，排队也吃预算），阈值应显著大于上面那档。
+# generating 长，阈值应显著大于上面那档。
 # 默认 6 小时（用户决策 2026-11-16）：容忍长队列积压，仅回收真正被遗弃的任务；
 # 环境变量 QUEUED_TASK_TIMEOUT_MIN 可覆盖（见 core/config.py）。
 CLEANUP_STALE_QUEUED_MIN = 360

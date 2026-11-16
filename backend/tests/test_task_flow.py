@@ -591,7 +591,7 @@ def test_image_transient_retry_still_works(client, worker_db):
 
 
 def test_worker_job_timeout_raised_for_video():
-    """修 3a：job_timeout 1800→3600（排队也吃预算，30 分钟必死）。"""
+    """修 3a：job_timeout 1800→3600（含闸门排队等执行期开销，1800 必死）。"""
     from backend.worker import WorkerSettings
 
     assert WorkerSettings.job_timeout == 3600

@@ -136,6 +136,14 @@ def claim_queued_task(db: Session, task_id: int) -> str | None:
     最新状态（不用会话缓存），非 queued 直接返回该状态让调用方放弃；仍为
     queued 则用条件 UPDATE 抢占（两 worker 同时认领只有一个成功）。
     先 commit 清空本会话事务，保证读到的是其他进程已提交的最新快照。
+
+    认领只占坑、不计时：不写 started_at。视频任务认领后可能要在渠道闸门
+    前排队数十分钟（GATE_QUEUE_TIMEOUT_S），若认领即写 started_at，30 分钟
+    generating 收尸会把闸门排队中的任务误判成孤儿标 failed，随后真正完成的
+    结果又被终态写保护丢弃（review 实证事故）。started_at 留给生成真正开始
+    的时刻（task_lifecycle.mark_started）；phase=waiting_gate 是“已认领、
+    生成未开始（可能在闸门排队）”的显式标记，收尸 sweep 以 started_at
+    IS NULL 识别并跳过这类任务。
     """
     db.commit()  # 结束旧事务：确保下面的 SELECT 取到最新已提交快照
     fresh_status, _cancel_at = _fresh_cancel_state(db, task_id)
@@ -148,7 +156,7 @@ def claim_queued_task(db: Session, task_id: int) -> str | None:
         db,
         task_id,
         "queued",
-        {"status": "generating", "started_at": now, "worker_heartbeat_at": now},
+        {"status": "generating", "phase": "waiting_gate", "worker_heartbeat_at": now},
     )
     if n == 0:
         # 认领窗口内被并发改写（reaper 失败化 / 另一 worker 认领）——重读定性
@@ -161,6 +169,20 @@ def claim_queued_task(db: Session, task_id: int) -> str | None:
         db.refresh(task)
     return "claimed"
 
+
+def ensure_claimed_task_startable(db: Session, task_id: int) -> str | None:
+    """闸门后、生成前的复检：任务仍可开始生成才返回 None，否则返回当前状态。
+
+    闸门前排队最长 GATE_QUEUE_TIMEOUT_S（3500s），期间任务可能已被并发写终态
+    （用户取消 / 收尸 reaper）——此时不得再启动生成。直读 DB 最新状态
+    （不用会话缓存）定性；已认领未终态（generating）则放行，started_at 由
+    task_lifecycle.mark_started 在生成真正开始时写入（闸门等待不计超时）。
+    """
+    db.commit()  # 结束旧事务：确保下面的 SELECT 取到最新已提交快照
+    fresh_status, _ = _fresh_cancel_state(db, task_id)
+    if fresh_status == "generating":
+        return None  # 已认领未终态——闸门已拿到，可以开始生成
+    return fresh_status
 
 def mark_cancel_requested(db: Session, task_id: int) -> bool:
     from datetime import datetime

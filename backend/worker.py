@@ -328,6 +328,24 @@ async def run_generation_task(
                 publish_task_event(task_id, "failed", {"error": msg})
                 return {"status": "failed", "error": msg}
             _gate_held = True
+        # 闸门后复检（review 事故修复）：闸门前排队最长 3500s，期间任务可能已被
+        # 并发写终态（取消 / 收尸）。再启动生成前直读 DB 最新状态，已终态/被改写
+        # 则直接放弃——不跑 provider、不覆盖既有终态。started_at 由 lifecycle 的
+        # mark_started 在此刻之后写入，闸门等待不计入 30 分钟生成超时。
+        from backend.app.services.task_store import ensure_claimed_task_startable
+
+        recheck = ensure_claimed_task_startable(db, task_id)
+        if recheck is not None:
+            logger.warning(
+                "task %s skipped after gate (status=%r): terminal/cancelled while "
+                "waiting at channel gate",
+                task_id, recheck,
+            )
+            return {
+                "status": "skipped",
+                "task_status": recheck or "missing",
+                "error": f"task no longer claimable after gate (status={recheck or 'missing'})",
+            }
         try:
             _lifecycle_started = True
             result = await run_task_lifecycle(
@@ -542,6 +560,10 @@ async def _cleanup_stale_tasks() -> None:
             db.query(Task)
             .filter(
                 Task.status == "generating",
+                # started_at IS NULL = 已认领但生成未开始（视频任务在渠道闸门
+                # 前排队，claim 不再预写 started_at）——闸门等待不计入 30 分钟
+                # 生成超时，这里绝不能收尸；闸门排队超时由闸门自身/回询兜底。
+                Task.started_at.isnot(None),
                 Task.started_at < cutoff,
             )
             .all()
@@ -588,22 +610,40 @@ async def _cleanup_stale_tasks() -> None:
     # queued 收尸：入队后长时间无人接手（队列/worker 崩溃遗留）——同样条件 UPDATE 防竞态。
     # 用 created_at（排队起点）而非 started_at（从未开始），且阈值独立且更大、可配置
     # （queued 生命周期含排队预算，默认 QUEUED_TASK_TIMEOUT_MIN=360 即 6 小时，见 core/config.py）。
+    # 同口径覆盖“已认领但卡在闸门前”的孤儿（generating + started_at IS NULL）：
+    # 30 分钟 generating 收尸豁免这类任务（闸门等待不计超时），而闸门自身排队
+    # 上限远小于本阈值——若它在此仍卡着，只可能是 worker 崩溃遗留，必须回收。
     try:
+        from sqlalchemy import and_, or_
+
         cutoff_q = datetime.utcnow() - timedelta(minutes=get_settings().queued_task_timeout_min)
         stale_q = (
             db.query(Task)
             .filter(
-                Task.status == "queued",
                 Task.created_at.isnot(None),
                 Task.created_at < cutoff_q,
+                or_(
+                    Task.status == "queued",
+                    and_(Task.status == "generating", Task.started_at.is_(None)),
+                ),
             )
             .all()
         )
         reaped_q = 0
         for t in stale_q:
+            # 条件 UPDATE 防竞态：仅当仍处于被回收前提态时生效（正在被 worker
+            # 接手/开跑的不会被误杀）
+            if t.status == "queued":
+                cond = (Task.id == t.id, Task.status == "queued")
+            else:  # generating + 闸门排队中（认领未开表）
+                cond = (
+                    Task.id == t.id,
+                    Task.status == "generating",
+                    Task.started_at.is_(None),
+                )
             n = (
                 db.query(Task)
-                .filter(Task.id == t.id, Task.status == "queued")
+                .filter(*cond)
                 .update(
                     {
                         "status": "failed",

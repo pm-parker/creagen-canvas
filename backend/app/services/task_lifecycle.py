@@ -266,7 +266,7 @@ async def run_task_lifecycle(
         return {"status": "failed", "error": str(exc)}
 
     except asyncio.CancelledError:
-        # arq 超时击杀（job_timeout 从入队计时，排队也吃预算）≠ 用户取消
+        # arq 超时击杀（job_timeout 从 job 开始执行计时，排队不吃预算）≠ 用户取消
         # （真取消走 TaskCancelledError 分支）。按 created_at 距终态的时长区分文案，
         # 杜绝"没人取消却报已取消"的误导（2026-10-08 过载事故实证：433-435 精确
         # 1800.2s 被杀却报"任务已被取消"）。
