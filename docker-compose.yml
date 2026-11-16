@@ -40,7 +40,7 @@ services:
       JWT_SECRET: ${JWT_SECRET:?请在 .env 设置 JWT_SECRET}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?请在 .env 设置 ENCRYPTION_KEY}
       REGISTER_MODE: ${REGISTER_MODE:-invite}
-      INVITE_CODES: ${INVITE_CODES:-letmein}
+      INVITE_CODES: ${INVITE_CODES:-}
     depends_on:
       db:
         condition: service_healthy
@@ -63,7 +63,7 @@ services:
       JWT_SECRET: ${JWT_SECRET}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY}
       REGISTER_MODE: ${REGISTER_MODE:-invite}
-      INVITE_CODES: ${INVITE_CODES:-letmein}
+      INVITE_CODES: ${INVITE_CODES:-}
       ENABLE_FAKE_PROVIDER: ${ENABLE_FAKE_PROVIDER:-false}
     volumes:
       - ./outputs:/app/outputs
@@ -96,7 +96,7 @@ services:
       JWT_SECRET: ${JWT_SECRET}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY}
       REGISTER_MODE: ${REGISTER_MODE:-invite}
-      INVITE_CODES: ${INVITE_CODES:-letmein}
+      INVITE_CODES: ${INVITE_CODES:-}
       ENABLE_FAKE_PROVIDER: ${ENABLE_FAKE_PROVIDER:-false}
     depends_on:
       db:
@@ -123,7 +123,7 @@ services:
       JWT_SECRET: ${JWT_SECRET}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY}
       REGISTER_MODE: ${REGISTER_MODE:-invite}
-      INVITE_CODES: ${INVITE_CODES:-letmein}
+      INVITE_CODES: ${INVITE_CODES:-}
       ENABLE_FAKE_PROVIDER: ${ENABLE_FAKE_PROVIDER:-false}
       WORKER_QUEUE: video
     depends_on:

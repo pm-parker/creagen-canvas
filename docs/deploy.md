@@ -2,8 +2,10 @@
 
 ## 三步起跑
 
-1. `git clone https://github.com/SonicBotMan/creagen-canvas.git && cd creagen-canvas`
-2. `cp .env.example .env` —— 必改三项：`JWT_SECRET`、`ENCRYPTION_KEY`（各 `openssl rand -hex 32`）、`INVITE_CODES`
+1. `git clone https://github.com/pm-parker/creagen-canvas.git && cd creagen-canvas`
+2. `cp .env.example .env` —— 必改三项：`JWT_SECRET`、`ENCRYPTION_KEY`（各 `openssl rand -hex 32`，
+   空值/不足 32 字符/示例占位值如 `change-me-…` 会被启动校验直接拒绝）、
+   `INVITE_CODES`（如 `openssl rand -hex 8`；无内置默认码，invite 模式下留空则注册一律拒绝）
 3. `docker compose up -d`
 
 服务拓扑：`api`(8080) + `worker`(arq) + `db`(PG16) + `redis`(7)，`migrate` 一次性任务自动跑迁移。
@@ -18,7 +20,7 @@
 
 - 反向代理层加 HTTPS（Caddy/Traefik/Cloudflare）
 - 保持 `REGISTER_MODE=invite`
-- `ENABLE_FAKE_PROVIDER=false`（默认）
+- `ENABLE_FAKE_PROVIDER=false`（默认；仅在本地开发/CI 需跑通 Fake 闭环时显式设 true）
 - API 不直接暴露公网时，经反代限流
 
 ## 验收
