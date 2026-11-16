@@ -283,6 +283,7 @@ function ChangePasswordSection() {
   const [confirm, setConfirm] = useState("");
   const [message, setMessage] = useState("");
   const [status, setStatus] = useState<"ok" | "err">("ok");
+  const setToken = useAuthStore((s) => s.setToken);
 
   const change = useMutation({
     mutationFn: () =>
@@ -290,8 +291,13 @@ function ChangePasswordSection() {
         method: "POST",
         json: { old_password: oldPassword, new_password: newPassword },
       }),
-    onSuccess: () => {
-      setMessage("密码已修改，下次登录请使用新密码");
+    onSuccess: (r) => {
+      // 服务端已轮换 token（旧 token 立即失效）：存回新 token 延续当前会话
+      const token = (r as { access_token?: string } | undefined)?.access_token;
+      if (typeof token === "string" && token) {
+        setToken(token);
+      }
+      setMessage("密码已修改，当前会话已保持，下次登录请使用新密码");
       setStatus("ok");
       setOldPassword("");
       setNewPassword("");

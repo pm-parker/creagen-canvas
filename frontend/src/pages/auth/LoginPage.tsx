@@ -1,6 +1,7 @@
 import { useState } from "react";
-import { Link, useNavigate } from "react-router";
+import { Link, useNavigate, useSearchParams } from "react-router";
 import { apiFetch } from "@/lib/api";
+import { safeNextTarget } from "@/lib/safeNextTarget";
 import { useAuthStore } from "@/stores/auth";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -12,6 +13,7 @@ interface TokenResponse {
 
 export function LoginPage() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const setAuth = useAuthStore((s) => s.setAuth);
   const [identifier, setIdentifier] = useState("");
   const [password, setPassword] = useState("");
@@ -33,7 +35,7 @@ export function LoginPage() {
         "/api/auth/me",
       );
       setAuth(access_token, me);
-      navigate("/");
+      navigate(safeNextTarget(searchParams.get("next")), { replace: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : "登录失败");
     } finally {

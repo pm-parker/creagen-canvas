@@ -8,7 +8,8 @@ export function RequireAuth() {
   const location = useLocation();
 
   if (!token) {
-    return <Navigate to="/login" state={{ from: location.pathname }} replace />;
+    const next = `${location.pathname}${location.search}`;
+    return <Navigate to={`/login?next=${encodeURIComponent(next)}`} state={{ from: location.pathname }} replace />;
   }
   return (
     <AppShell>
