@@ -73,8 +73,9 @@ def _create_migrated_engine(pre_create_snapshots_table: bool = False) -> Generat
     prev_env = {k: os.environ.get(k) for k in ("DATABASE_URL", "JWT_SECRET", "ENCRYPTION_KEY")}
     os.environ["DATABASE_URL"] = test_url
     # 测试回退值（非真实密钥）：字面量长度 ≥32，不依赖环境/占位符展开后的长度
-    os.environ.setdefault("JWT_SECRET", "it-jwt-secret-0123456789abcdef-TEST")
-    os.environ.setdefault("ENCRYPTION_KEY", "it-encryption-key-0123456789abcdef-TEST")
+    os.environ.setdefault("JWT_SECRET", "it-jwt-secret-0123456789abcdef-TEST")  # gitleaks:allow
+    _enc_key = "it-encryption-key-0123456789abcdef-TEST"  # gitleaks:allow
+    os.environ.setdefault("ENCRYPTION_KEY", _enc_key)
     get_settings.cache_clear()
 
     from alembic.config import Config
