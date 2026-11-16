@@ -12,6 +12,9 @@ Create Date: 2026-11-16
 变更清单：
 1. 新建 canvas_snapshots 表（列/类型/可空性/FK 与模型逐列一致）+ 索引
    ix_canvas_snapshots_project_id（模型 project_id 上 index=True）。
+   防御：部分部署曾手工建过该表（迁移缺位时期的自救），upgrade 前用
+   sa.inspect(op.get_bind()).has_table() 探测，表已存在则跳过建表；
+   索引仅在缺失时补建（手工建的表常漏索引）。downgrade 保持原样。
 2. canvas_projects.share_token：模型声明 unique=True, index=True → 唯一索引名应为
    ix_canvas_projects_share_token；历史迁移建的是 uq_canvas_share_token，重命名对齐。
 3. production_manifests.project_id：模型声明 unique=True, index=True → 唯一索引
@@ -27,35 +30,46 @@ Create Date: 2026-11-16
   nullable=False（保留 default=func.now()），向库对齐而不放松完整性。
 """
 
-from typing import Sequence, Union
+from collections.abc import Sequence
 
 import sqlalchemy as sa
-from alembic import op
+from alembic import context, op
 
 revision: str = "47c1e43d98a4"
-down_revision: Union[str, Sequence[str], None] = "b1c2d3e4f5a7"
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | Sequence[str] | None = "b1c2d3e4f5a7"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    # 1) 画布版本快照表（此前完全没有迁移，新库上快照接口 500）
-    op.create_table(
-        "canvas_snapshots",
-        sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
-        sa.Column("project_id", sa.Integer(), nullable=False),
-        sa.Column("version", sa.Integer(), nullable=False),
-        sa.Column("label", sa.String(length=200), nullable=False),
-        sa.Column("nodes_json", sa.Text(), nullable=False),
-        sa.Column("connections_json", sa.Text(), nullable=False),
-        sa.Column("created_by", sa.Integer(), nullable=True),
-        sa.Column("created_at", sa.DateTime(), nullable=True),
-        sa.ForeignKeyConstraint(["project_id"], ["canvas_projects.id"], ondelete="CASCADE"),
-        sa.PrimaryKeyConstraint("id"),
-    )
-    op.create_index(
-        "ix_canvas_snapshots_project_id", "canvas_snapshots", ["project_id"], unique=False
-    )
+    bind = op.get_bind()
+
+    # 1) 画布版本快照表（此前完全没有迁移，新库上快照接口 500）。
+    #    迁移长期缺位期间，部分部署手工 CREATE TABLE 过该表——已存在则跳过建表
+    #    （假设其结构与模型一致），仅在索引缺失时补建，保证 upgrade 不炸。
+    #    offline 模式（alembic upgrade --sql / 单测里的静态 SQL 渲染）拿不到真实
+    #    连接（MockConnection 不可 inspect），此时假定表不存在、直接渲染建表 DDL。
+    offline = context.is_offline_mode()
+    if offline or not sa.inspect(bind).has_table("canvas_snapshots"):
+        op.create_table(
+            "canvas_snapshots",
+            sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
+            sa.Column("project_id", sa.Integer(), nullable=False),
+            sa.Column("version", sa.Integer(), nullable=False),
+            sa.Column("label", sa.String(length=200), nullable=False),
+            sa.Column("nodes_json", sa.Text(), nullable=False),
+            sa.Column("connections_json", sa.Text(), nullable=False),
+            sa.Column("created_by", sa.Integer(), nullable=True),
+            sa.Column("created_at", sa.DateTime(), nullable=True),
+            sa.ForeignKeyConstraint(["project_id"], ["canvas_projects.id"], ondelete="CASCADE"),
+            sa.PrimaryKeyConstraint("id"),
+        )
+    if offline or "ix_canvas_snapshots_project_id" not in [
+        ix["name"] for ix in sa.inspect(bind).get_indexes("canvas_snapshots")
+    ]:
+        op.create_index(
+            "ix_canvas_snapshots_project_id", "canvas_snapshots", ["project_id"], unique=False
+        )
 
     # 2) 分享 token 唯一索引改名（对齐模型 unique+index 的默认命名）
     op.drop_index("uq_canvas_share_token", table_name="canvas_projects")

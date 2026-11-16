@@ -42,7 +42,20 @@ def _with_db_name(url: str, db_name: str) -> str:
 
 @pytest.fixture(scope="module")
 def migrated_engine() -> Generator:
-    """真实 PG：建一个临时库，完全用 alembic 迁移升到 head（不用 create_all）。"""
+    yield from _create_migrated_engine()
+
+
+@pytest.fixture(scope="module")
+def precreated_snapshots_engine() -> Generator:
+    yield from _create_migrated_engine(pre_create_snapshots_table=True)
+
+
+def _create_migrated_engine(pre_create_snapshots_table: bool = False) -> Generator:
+    """真实 PG：建一个临时库，完全用 alembic 迁移升到 head（不用 create_all）。
+
+    pre_create_snapshots_table=True 时，先手工 CREATE TABLE canvas_snapshots
+    （模拟迁移长期缺位期间自救过的部署），迁移必须幂等地跳过建表仍升到 head。
+    """
     if not _BASE_URL.startswith(("postgresql://", "postgresql+psycopg://")):
         pytest.skip("需要 PostgreSQL（TEST_DATABASE_URL / DATABASE_URL）")
 
@@ -59,8 +72,9 @@ def migrated_engine() -> Generator:
 
     prev_env = {k: os.environ.get(k) for k in ("DATABASE_URL", "JWT_SECRET", "ENCRYPTION_KEY")}
     os.environ["DATABASE_URL"] = test_url
-    os.environ.setdefault("JWT_SECRET", "migration-test-secret-0000")
-    os.environ.setdefault("ENCRYPTION_KEY", "migration-test-enc-key-0000")
+    # 测试回退值（非真实密钥）：字面量长度 ≥32，不依赖环境/占位符展开后的长度
+    os.environ.setdefault("JWT_SECRET", "it-jwt-secret-0123456789abcdef-TEST")
+    os.environ.setdefault("ENCRYPTION_KEY", "it-encryption-key-0123456789abcdef-TEST")
     get_settings.cache_clear()
 
     from alembic.config import Config
@@ -74,6 +88,25 @@ def migrated_engine() -> Generator:
             conn.execute(text("DROP SCHEMA public CASCADE"))
             conn.execute(text("CREATE SCHEMA public"))
         engine.dispose()
+
+    if pre_create_snapshots_table:
+        # 模拟真实部署：已跑到旧 head（b1c2d3e4f5a7），迁移缺位期间手工建表自救
+        # （故意不建 ix_canvas_snapshots_project_id 索引），之后新迁移才落地。
+        command.upgrade(alembic_cfg, "b1c2d3e4f5a7")
+        bootstrap = create_engine(test_url)
+        with bootstrap.begin() as conn:
+            conn.execute(
+                text(
+                    "CREATE TABLE canvas_snapshots ("
+                    "id SERIAL PRIMARY KEY, "
+                    "project_id INTEGER NOT NULL REFERENCES canvas_projects(id) "
+                    "ON DELETE CASCADE, "
+                    "version INTEGER NOT NULL, label VARCHAR(200) NOT NULL, "
+                    "nodes_json TEXT NOT NULL, connections_json TEXT NOT NULL, "
+                    "created_by INTEGER, created_at TIMESTAMP)"
+                )
+            )
+        bootstrap.dispose()
 
     command.upgrade(alembic_cfg, "head")
     command.check(alembic_cfg)  # 迁移库必须与模型一致（alembic check 语义）
@@ -192,3 +225,30 @@ def test_canvas_snapshots_table_matches_model(migrated_engine):
     assert actual == expected, (
         f"canvas_snapshots 漂移: 缺 {expected - actual}, 多 {actual - expected}"
     )
+
+
+def test_upgrade_succeeds_when_table_was_created_manually(precreated_snapshots_engine):
+    """手工建过 canvas_snapshots 的部署，迁移必须幂等地跳过建表仍升到 head（Review 反馈）。
+
+    迁移长期缺位期间，部分部署曾手工 CREATE TABLE 自救；upgrade 不探测就 create_table
+    会直接 DuplicateTable 崩掉。本用例先建表（且故意不建索引），再 upgrade head + check，
+    并验证索引被补建、表结构仍与模型一致。
+    """
+    import sqlalchemy as sa
+
+    with precreated_snapshots_engine.connect() as conn:
+        idx = {i["name"] for i in sa.inspect(conn).get_indexes("canvas_snapshots")}
+        cols = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'canvas_snapshots'"
+                )
+            )
+        }
+    # 手工表漏的索引必须被迁移补建
+    assert "ix_canvas_snapshots_project_id" in idx
+    # 表结构仍与模型对齐（fixture 里的 alembic check 已做全量比对，这里钉列级回归）
+    expected = {c.name for c in Base.metadata.tables["canvas_snapshots"].columns}
+    assert cols == expected
