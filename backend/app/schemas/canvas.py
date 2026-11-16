@@ -33,6 +33,9 @@ class ConnectionItem(BaseModel):
 class BulkNodesUpdate(BaseModel):
     nodes: list[NodeItem]
     base_revision: int | None = None  # 乐观锁（缺省=外部直写，不校验）
+    # 客户端显式删除的节点 client_id（base 快照里有、但本地已删掉的节点）。
+    # 服务端按此精确删除——含 Agent 建的节点（用户有权删）。
+    deleted_client_ids: list[str] = Field(default_factory=list)
 
 
 class BulkConnectionsUpdate(BaseModel):

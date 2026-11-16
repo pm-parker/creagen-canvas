@@ -25,10 +25,12 @@ def _project(client, headers) -> int:
     return r.json()["project"]["id"]
 
 
-def _put(client, headers, pid, nodes, base_revision=None):
+def _put(client, headers, pid, nodes, base_revision=None, deleted_client_ids=None):
     body: dict = {"nodes": nodes}
     if base_revision is not None:
         body["base_revision"] = base_revision
+    if deleted_client_ids is not None:
+        body["deleted_client_ids"] = deleted_client_ids
     return client.put(f"/api/canvas/projects/{pid}/nodes", json=body, headers=headers)
 
 
@@ -184,6 +186,142 @@ class TestDeletionScope:
         assert cids == ["c1"]
 
 
+class TestExplicitDeletion:
+    """round-3 回归：用户必须能删 Agent 建的节点（base 感知的显式删除）。"""
+
+    def _agent_node(self, db_session, pid, cid, created_rev=None, agent=True):
+        from backend.app.models import CanvasNode
+
+        meta = {"client_id": cid, "canvas_agent": True, "prompt": "agent 产物"}
+        if created_rev is not None:
+            meta["_created_rev"] = created_rev
+        node = CanvasNode(
+            project_id=pid,
+            type="image",
+            title="Agent 节点",
+            metadata_json=json.dumps(meta, ensure_ascii=False),
+        )
+        db_session.add(node)
+        db_session.commit()
+        return node
+
+    def test_agent_node_loaded_then_deleted_via_deleted_client_ids(self, client, db_session):
+        """客户端加载（base 含 Agent 节点）后删掉它 → deleted_client_ids 精确删除。"""
+        headers = _headers(client)
+        pid = _project(client, headers)
+        r = _put(client, headers, pid, [_node("c1")], base_revision=0)
+        revision = r.json()["revision"]
+        self._agent_node(db_session, pid, "agent-abc", created_rev=revision + 1)
+
+        # 客户端加载：base 含 agent-abc
+        r = client.get(f"/api/canvas/projects/{pid}", headers=headers)
+        loaded_rev = r.json()["project"]["revision"]
+        assert {n["metadata"].get("client_id") for n in r.json()["project"]["nodes"]} == {
+            "c1",
+            "agent-abc",
+        }
+
+        # 用户删掉 Agent 节点后保存：payload 只剩 c1 + deleted_client_ids=[agent-abc]
+        r = _put(
+            client,
+            headers,
+            pid,
+            [_node("c1")],
+            base_revision=loaded_rev,
+            deleted_client_ids=["agent-abc"],
+        )
+        assert r.status_code == 200, r.text
+        cids = [n["metadata"].get("client_id") for n in r.json()["nodes"]]
+        assert cids == ["c1"]  # Agent 节点已被删除（不再复活）
+
+    def test_agent_node_created_after_base_survives_omission(self, client, db_session):
+        """Agent 节点在客户端 base 之后创建、且未进 deleted_client_ids → 保留。"""
+        headers = _headers(client)
+        pid = _project(client, headers)
+        r = _put(client, headers, pid, [_node("c1")], base_revision=0)
+        revision = r.json()["revision"]
+        # 服务端在客户端加载（base=revision）之后新建的 Agent 节点
+        self._agent_node(db_session, pid, "agent-late", created_rev=revision + 3)
+
+        # 客户端陈旧保存（不知道 agent-late，也未声明删除）→ 节点保留
+        r = _put(client, headers, pid, [_node("c1")], base_revision=revision)
+        assert r.status_code == 200
+        cids = [n["metadata"].get("client_id") for n in r.json()["nodes"]]
+        assert "agent-late" in cids
+
+    def test_deleted_client_ids_matches_legacy_db_id(self, client, db_session):
+        """旧客户端按数据库 id 声明删除也命中（与 upsert 的 legacy 命中对称）。"""
+        headers = _headers(client)
+        pid = _project(client, headers)
+        r = _put(client, headers, pid, [_node("c1"), _node("c2")], base_revision=0)
+        revision = r.json()["revision"]
+        db_id = next(n["id"] for n in r.json()["nodes"] if n["metadata"].get("client_id") == "c2")
+
+        r = _put(
+            client,
+            headers,
+            pid,
+            [_node("c1")],
+            base_revision=revision,
+            deleted_client_ids=[str(db_id)],
+        )
+        cids = [n["metadata"].get("client_id") for n in r.json()["nodes"]]
+        assert cids == ["c1"]
+
+    def test_unknown_deleted_client_id_is_noop(self, client):
+        """deleted_client_ids 指向不存在的节点 → 忽略（幂等重试安全）。"""
+        headers = _headers(client)
+        pid = _project(client, headers)
+        _put(client, headers, pid, [_node("c1")], base_revision=0)
+        r = _put(
+            client,
+            headers,
+            pid,
+            [_node("c1")],
+            base_revision=1,
+            deleted_client_ids=["ghost-cid"],
+        )
+        assert r.status_code == 200
+        assert len(r.json()["nodes"]) == 1
+
+    def test_agent_node_endpoint_sets_created_rev_and_bumps_revision(self, client, db_session):
+        """Agent 建节点端点写入 _created_rev 并递增 revision（客户端 409 而非误删）。"""
+        from unittest.mock import patch
+
+        headers = _headers(client)
+        pid = _project(client, headers)
+        r = _put(client, headers, pid, [_node("c1")], base_revision=0)
+        revision = r.json()["revision"]
+
+        key = client.post("/api/settings/api-key", headers=headers).json()["api_key"]
+        with patch("backend.app.services.task_queue.enqueue_generation_task") as eq:
+            eq.return_value = None
+            r = client.post(
+                f"/api/canvas/projects/{pid}/agent",
+                headers={"X-API-Key": key},
+                json={"message": "一只猫"},
+            )
+        assert r.status_code == 202, r.text
+        agent_cid = r.json()["node_client_id"]
+
+        from backend.app.models import CanvasNode
+
+        node = (
+            db_session.query(CanvasNode)
+            .filter(CanvasNode.project_id == pid)
+            .all()
+        )
+        agent_meta = next(
+            json.loads(n.metadata_json)
+            for n in node
+            if json.loads(n.metadata_json).get("client_id") == agent_cid
+        )
+        assert agent_meta["_created_rev"] == revision + 1  # 服务端改动 → revision 递增
+        # 陈旧客户端保存（base 仍是旧 revision）→ 409 而非删除新节点
+        r = _put(client, headers, pid, [_node("c1")], base_revision=revision)
+        assert r.status_code == 409
+
+
 class TestMetadataValidation:
     """(d)：合法 JSON 但非对象 → 422（不 500）。"""
 
@@ -244,6 +382,35 @@ class TestRevisionGuards:
         r = _put(client, headers, pid, [_node("c1")], base_revision=0)
         assert r.status_code == 409
         assert r.json()["detail"]["code"] == "REVISION_CONFLICT"
+
+    def test_conflict_detail_carries_server_state(self, client):
+        """409 detail 附带当前服务端全量状态（客户端免 GET 三方合并）。"""
+        headers = _headers(client)
+        pid = _project(client, headers)
+        r = _put(client, headers, pid, [_node("c1"), _node("c2")], base_revision=0)
+        ids = [n["id"] for n in r.json()["nodes"]]
+        current_rev = r.json()["revision"]
+        client.put(
+            f"/api/canvas/projects/{pid}/connections",
+            json={"connections": [{"from_node_id": ids[0], "to_node_id": ids[1]}]},
+            headers=headers,
+        )
+        # 另一端已推进 revision（如 Agent 建节点/恢复快照）→ 陈旧保存拿 409
+        r = _put(client, headers, pid, [_node("c1")], base_revision=current_rev - 1)
+        assert r.status_code == 409
+        detail = r.json()["detail"]
+        assert detail["code"] == "REVISION_CONFLICT"
+        assert detail["current_revision"] == current_rev
+        # nodes 与成功响应同形状；含全部节点（含客户端未提交的 c2）
+        nodes = detail["nodes"]
+        assert {n["metadata"].get("client_id") for n in nodes} == {"c1", "c2"}
+        for n in nodes:
+            assert {"id", "type", "title", "position", "width", "height", "metadata"} <= set(n)
+        # connections 也一并携带（from/to 指向服务端当前节点 id）
+        conns = detail["connections"]
+        assert len(conns) == 1
+        assert conns[0]["from_node_id"] == ids[0]
+        assert conns[0]["to_node_id"] == ids[1]
 
     def test_restore_keeps_edges_valid(self, client):
         """恢复后连线端点随节点重建映射（不悬空）。"""

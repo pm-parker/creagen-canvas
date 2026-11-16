@@ -334,27 +334,42 @@ def sync_nodes(
     """节点同步：按 metadata.client_id 稳定 upsert（id 不再随保存变化）。
 
     并发保护（H1）：body.base_revision 与 project.revision 不一致时 409
-    REVISION_CONFLICT（携带当前 revision），由客户端合并后重试；
-    不带 base_revision（外部工具/旧客户端）跳过校验直接应用。
+    REVISION_CONFLICT，detail 携带当前服务端全量状态（current_revision/nodes/
+    connections，与成功响应同形状）——客户端用上次同步的 base 快照做三方合并，
+    免额外 GET 即可重试；不带 base_revision（外部工具/旧客户端）跳过校验直接应用。
     命中规则：client_id 命中既有节点的 metadata.client_id；旧客户端把数据库 id
     当 client_id 传（str(existing.id)）也命中 → 原地 UPDATE（数据库 id 不变）。
     metadata 合并：客户端键覆盖同名键，服务端写入的键（outputUrl/extraUrls/
     durationSec 等）缺失或为 null 时保留服务端既有值；width/height 未提供则保留。
-    删除语义：只删"客户端本就知道"的既有节点（本次集合外、且非服务端 Agent 节点、
-    且创建 revision 不晚于 base_revision）；服务端在客户端加载后新建的节点保留。
+    删除语义（base 感知）：
+    - 显式：body.deleted_client_ids 里的 client_id 精确删除（含 Agent 建的节点
+      ——用户有权删自己画布上的任何节点）；
+    - 兼容：本次集合外、且创建 revision 不晚于 base_revision 的节点（客户端本就知道
+      的）视为删除；
+    - 保留：服务端在客户端加载之后新建的节点（_created_rev > base_revision），
+      客户端没见过 → 不因陈旧保存而消失。
     无 client_id 的存量节点（外部写入）保留不删。
     """
     project = _own_project_or_404(db, project_id, user)
     import json as _json
 
     if body.base_revision is not None and body.base_revision != (project.revision or 0):
+        cur_nodes = db.query(CanvasNode).filter(CanvasNode.project_id == project.id).all()
+        cur_conns = (
+            db.query(CanvasConnection)
+            .filter(CanvasConnection.project_id == project.id)
+            .all()
+        )
         raise HTTPException(
             status_code=409,
             detail={
                 "code": "REVISION_CONFLICT",
                 "message": "画布已在其他窗口被修改",
-                "hint": "已自动合并服务端最新内容后重试",
+                "hint": "客户端将基于此状态三方合并后自动重试",
                 "current_revision": project.revision or 0,
+                # 当前服务端全量状态（与成功响应同形状）：客户端免 GET 完成三方合并
+                "nodes": [n.to_dict() for n in cur_nodes],
+                "connections": [c.to_dict() for c in cur_conns],
             },
         )
 
@@ -407,26 +422,35 @@ def sync_nodes(
         if hit is not None:
             matched.add(int(hit.id))
 
-    if incoming_cids:
-        # UI 保存形态：只删"客户端本就知道"的节点
+    # 客户端显式删除（base 快照里有、本地已删）：精确删除——含 Agent 建的节点
+    # （用户有权删自己画布上的任何节点，包括服务端 Agent 建的）
+    explicit_deleted: set[int] = set()
+    for raw_cid in body.deleted_client_ids or []:
+        cid = str(raw_cid)
+        hit = by_cid.get(cid) or by_db_id.get(cid)
+        if hit is not None:
+            explicit_deleted.add(int(hit.id))
+
+    if incoming_cids or explicit_deleted:
+        # UI 保存形态：显式删除 + "客户端本就知道"的省略即删除
         for cid, node in by_cid.items():
             if cid in incoming_cids:
                 continue
             if node.id in matched:
                 continue  # 本次提交命中（legacy 客户端按数据库 id 回传）
-            meta = meta_by_node.get(int(node.id), {})
-            if meta.get("canvas_agent"):
-                # 服务端 Agent 建的节点：客户端无权删除
+            if int(node.id) in explicit_deleted:
+                db.delete(node)  # 显式删除：Agent/用户建的节点都可删
                 continue
-            created_rev = meta.get(CREATED_REV_KEY)
-            if (
-                body.base_revision is not None
-                and isinstance(created_rev, int)
-                and created_rev > body.base_revision
-            ):
-                # 客户端加载之后新建的节点（Agent 回流等）：保留，不被陈旧保存删除
+            if body.base_revision is None:
+                # 旧客户端（无乐观锁）：省略即删除（旧全量替换语义）
+                db.delete(node)
                 continue
-            db.delete(node)
+            created_rev = meta_by_node.get(int(node.id), {}).get(CREATED_REV_KEY)
+            if isinstance(created_rev, int) and created_rev <= body.base_revision:
+                # 客户端加载时就知道的节点：省略即删除
+                db.delete(node)
+            # 服务端在客户端加载之后新建（_created_rev > base_revision）或创建时间
+            # 未知的节点：保留，不被陈旧保存删除
     else:
         # 外部直写形态（payload 全无 client_id）：保持旧全量替换语义
         db.query(CanvasNode).filter(CanvasNode.project_id == project.id).delete()

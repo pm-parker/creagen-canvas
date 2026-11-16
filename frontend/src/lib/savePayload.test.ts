@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildNodePayload, mapEdgesByNodeOrder } from "./savePayload";
+import { buildNodePayload, collectDeletedClientIds, mapEdgesByNodeOrder } from "./savePayload";
 import type { CanvasNode } from "@/stores/canvas";
 
 function mkNode(id: string, x: number, y: number): CanvasNode {
@@ -110,5 +110,24 @@ describe("mapEdgesByNodeOrder（Review Focus #4：id 漂移）", () => {
 
   it("空边返回空", () => {
     expect(mapEdgesByNodeOrder([], [{ id: 1, client_id: "x" }])).toEqual([]);
+  });
+});
+
+describe("collectDeletedClientIds（round-3：显式删除 base 感知）", () => {
+  it("base 有、本地没有 → 收集为 deleted_client_ids（含 Agent 节点）", () => {
+    const base = [{ id: "uuid-a" }, { id: "agent-x" }, { id: "uuid-b" }];
+    const current = [{ id: "uuid-a" }];
+    expect(collectDeletedClientIds(base, current)).toEqual(["agent-x", "uuid-b"]);
+  });
+
+  it("base 为空/未加载 → 不删（服务端在客户端加载后新建的节点不受影响）", () => {
+    expect(collectDeletedClientIds(null, [])).toEqual([]);
+    expect(collectDeletedClientIds([], [])).toEqual([]);
+  });
+
+  it("本地新增的节点不算删除；去重", () => {
+    const base = [{ id: "a" }, { id: "a" }];
+    const current = [{ id: "a" }, { id: "new-1" }];
+    expect(collectDeletedClientIds(base, current)).toEqual([]);
   });
 });

@@ -24,6 +24,11 @@ export interface ServerNode {
   metadata?: { client_id?: string | null } | null;
 }
 
+/** 只含 id 的节点（base 快照 / 本地节点都满足）。 */
+export interface NodeIdLike {
+  id: string;
+}
+
 /**
  * RF 节点 → 后端 bulk sync 字段。
  *
@@ -53,6 +58,26 @@ export function buildNodePayload(nodes: CanvasNode[]): BackendNodePayload[] {
       metadata_json: JSON.stringify(merged),
     };
   });
+}
+
+/**
+ * 收集"base 快照里有、本地已删掉"的节点 id（= client_id）。
+ *
+ * 服务端按此精确删除——含 Agent 建的节点（用户有权删自己画布上的任何节点）。
+ * 只删"客户端本就知道"的节点：服务端在客户端加载之后新建的节点（base 里没有）
+ * 不会被误删。
+ */
+export function collectDeletedClientIds(
+  baseNodes: NodeIdLike[] | null | undefined,
+  currentNodes: NodeIdLike[],
+): string[] {
+  if (!baseNodes || baseNodes.length === 0) return [];
+  const present = new Set(currentNodes.map((n) => n.id));
+  const out: string[] = [];
+  for (const n of baseNodes) {
+    if (!present.has(n.id) && !out.includes(n.id)) out.push(n.id);
+  }
+  return out;
 }
 
 /**

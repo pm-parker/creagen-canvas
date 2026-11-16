@@ -800,6 +800,12 @@ def to_canvas_endpoint(
     db.add(project)
     db.flush()
 
+    # 服务端建节点带 _created_rev（新项目 revision=0）：客户端保存 base 感知删除的依据
+    from backend.app.services.canvas_writeback import CREATED_REV_KEY
+
+    def _srv_meta(m: dict) -> dict:
+        return {CREATED_REV_KEY: project.revision or 0, **m}
+
     count = 0
     if sb.final_video_url:
         db.add(
@@ -812,11 +818,13 @@ def to_canvas_endpoint(
                 width=280,
                 height=180,
                 metadata_json=_json.dumps(
-                    {
-                        "client_id": f"sb{sid}-final",
-                        "outputUrl": sb.final_video_url,
-                        "storyboardFinal": True,
-                    },
+                    _srv_meta(
+                        {
+                            "client_id": f"sb{sid}-final",
+                            "outputUrl": sb.final_video_url,
+                            "storyboardFinal": True,
+                        }
+                    ),
                     ensure_ascii=False,
                 ),
             )
@@ -833,11 +841,13 @@ def to_canvas_endpoint(
                 width=280,
                 height=180,
                 metadata_json=_json.dumps(
-                    {
-                        "client_id": f"sb{sid}-seg{seg.segment_index}",
-                        "outputUrl": seg.output_video_url,
-                        "prompt": seg.prompt or "",
-                    },
+                    _srv_meta(
+                        {
+                            "client_id": f"sb{sid}-seg{seg.segment_index}",
+                            "outputUrl": seg.output_video_url,
+                            "prompt": seg.prompt or "",
+                        }
+                    ),
                     ensure_ascii=False,
                 ),
             )
