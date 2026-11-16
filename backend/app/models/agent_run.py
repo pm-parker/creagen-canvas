@@ -4,7 +4,18 @@ spec: docs/superpowers/specs/2026-10-09-homepage-agent-design.md §1
 messages_json 为脑对话历史真相源（重启恢复）；pending_json 类型化等待物（v2 可扩 skill/remote）。
 """
 
-from sqlalchemy import BigInteger, Column, DateTime, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    func,
+)
 
 from backend.app.models.base import Base
 
@@ -14,6 +25,9 @@ AGENT_RUN_TERMINAL_STATUSES = ("completed", "failed", "stopped", "incomplete")
 
 class AgentRun(Base):
     __tablename__ = "agent_runs"
+
+    # 用户维度查运行（agent_run_store.get_active_run / list_runs 走 user_id+status）
+    __table_args__ = (Index("ix_agent_runs_user_status", "user_id", "status"),)
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
