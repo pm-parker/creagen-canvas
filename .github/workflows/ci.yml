@@ -43,7 +43,7 @@ jobs:
         env:
           DATABASE_URL: postgresql+psycopg://creagen:creagen@localhost:5432/creagen
           REDIS_URL: redis://localhost:6379/0
-          JWT_SECRET: ci-jwt-secret-0123456789abcdef-jwt
+          JWT_SECRET: ci-jwt-secret-0123456789abcdef-jwt  # gitleaks:allow (CI 测试用假密钥)
           ENCRYPTION_KEY: ci-encryption-key-0123456789abcdef
           REGISTER_MODE: open
 
