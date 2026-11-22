@@ -20,6 +20,7 @@
 - 保持 `REGISTER_MODE=invite`
 - `ENABLE_FAKE_PROVIDER=false`（默认）
 - API 不直接暴露公网时，经反代限流
+- 队列积压容忍度可用 `QUEUED_TASK_TIMEOUT_MIN` 调整（分钟，queued 任务超时收尸阈值，默认 360 即 6 小时）
 
 ## 验收
 
