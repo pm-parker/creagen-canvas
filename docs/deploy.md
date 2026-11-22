@@ -23,17 +23,23 @@
 
 ### 反向代理与登录限流的客户端 IP
 
-登录限流（`backend/app/routers/auth.py`）以 `request.client.host` 作为 per-IP 计数键。uvicorn 默认不解析代理头，直连时该值就是反代的 IP——所有用户共享同一个桶。因此挂在 nginx 等反代后面时，必须让 uvicorn 信任代理头且只信任代理本身：
+登录限流（`backend/app/routers/auth.py`）以 `request.client.host` 作为 per-IP 计数键。当前镜像还没有加上代理头参数。`docker/api.Dockerfile` 的实际命令是：
 
-- 启动参数加 `--proxy-headers --forwarded-allow-ips="<反代IP>"`（或设置环境变量 `FORWARDED_ALLOW_IPS`），本仓库的 uvicorn 命令在 `docker/api.Dockerfile`：
+```dockerfile
+CMD ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+```
 
-  ```dockerfile
-  CMD ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8080",
-       "--proxy-headers", "--forwarded-allow-ips", "172.17.0.1"]
-  ```
+`docker-compose.yml` 的 `api` 服务不覆盖这条命令，环境变量里也没有 `FORWARDED_ALLOW_IPS`、`--proxy-headers` 或 `--forwarded-allow-ips`。仓库因此没有把任何反代地址配成可信来源。uvicorn CLI 在未传入 `--forwarded-allow-ips`、也未设置 `FORWARDED_ALLOW_IPS` 时，信任列表只含本机回环（已核对 uvicorn 0.54 的帮助文本：`127.0.0.1,::1`；`--proxy-headers` 默认为开启）。容器网桥上的反代不在这张表里，`X-Forwarded-For` 不会被采用，`request.client.host` 仍是反代自己的地址，所有用户落在同一个限流桶。
 
-  反代与 api 同机 docker 网络时填网关地址（如 `172.17.0.1` 或 compose 网段）；也可改用 `environment: FORWARDED_ALLOW_IPS=...`。
-- `--forwarded-allow-ips` 只能填可信反代的 IP，切勿填 `*`：`X-Forwarded-For` 可被任意客户端伪造，信任它会让人冒充他人 IP 绕过限流。
+部署在反代后面时，由部署方在启动命令里自行加上参数，地址填这次部署里反代连接 api 所用的地址：
+
+```text
+uvicorn backend.app.main:app --host 0.0.0.0 --port 8080 \
+  --proxy-headers --forwarded-allow-ips=<反代IP>
+```
+
+也可以由部署方自己设置环境变量 `FORWARDED_ALLOW_IPS=<反代IP>`（本仓库的 compose 没有这项）。`--forwarded-allow-ips` 只能填可信反代的 IP，切勿填 `*`：`X-Forwarded-For` 可被任意客户端伪造，信任它会让人冒充他人 IP 绕过限流。
+
 - nginx 侧配合（只转发，并覆盖客户端传入的头）：
 
   ```nginx
