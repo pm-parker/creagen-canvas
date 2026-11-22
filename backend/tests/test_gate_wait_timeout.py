@@ -160,3 +160,141 @@ def test_gate_wait_worker_crash_reaped_by_queued_sweep(client, worker_db, db_ses
     final = db_session.get(Task, stuck.id)
     assert final.status == "failed"
     assert "排队超时" in (final.error_msg or "")
+
+
+def _patch_gate(monkeypatch, acquire, release):
+    from backend.app.services import video_gate
+
+    monkeypatch.setattr(video_gate, "acquire_video_gate", acquire)
+    monkeypatch.setattr(video_gate, "release_video_gate", release)
+
+
+def test_cancel_during_gate_wait_releases_acquired_gate_once(
+    client, worker_db, db_session, monkeypatch
+):
+    """闸门等待期间被取消：已成功拿到的槽位释放恰好一次，且不再生成。"""
+    from backend.app.models import Task
+    from backend.worker import run_generation_task
+
+    t = Task(user_id=1, type="video", prompt="p", model="fake-video", status="queued")
+    db_session.add(t)
+    db_session.commit()
+    tid = int(t.id)
+    releases = {"n": 0}
+
+    async def fake_acquire(redis, ch, limit=2, **kw):
+        s = worker_db()
+        row = s.get(Task, tid)
+        row.status = "cancelled"
+        row.cancel_requested_at = datetime.utcnow()
+        s.commit()
+        s.close()
+        return True
+
+    async def fake_release(redis, ch):
+        releases["n"] += 1
+
+    _patch_gate(monkeypatch, fake_acquire, fake_release)
+    res = asyncio.run(run_generation_task({"redis": object()}, tid))
+    db_session.expire_all()
+    final = db_session.get(Task, tid)
+    assert res["status"] == "skipped"
+    assert final.status == "cancelled"
+    assert releases["n"] == 1
+
+
+def test_cleanup_during_gate_wait_releases_acquired_gate_once(
+    client, worker_db, db_session, monkeypatch
+):
+    """闸门等待期间被收尸写成 failed：已成功拿到的槽位释放恰好一次，终态保持 failed。"""
+    from datetime import timedelta
+
+    from backend.app.models import Task
+    from backend.worker import run_generation_task, run_maintenance_job
+
+    t = Task(user_id=1, type="video", prompt="p", model="fake-video", status="queued")
+    db_session.add(t)
+    db_session.commit()
+    tid = int(t.id)
+    releases = {"n": 0}
+
+    async def fake_acquire(redis, ch, limit=2, **kw):
+        s = worker_db()
+        row = s.get(Task, tid)
+        row.created_at = datetime.utcnow() - timedelta(hours=7)
+        s.commit()
+        s.close()
+        await run_maintenance_job({}, "cleanup_stale_tasks", None)
+        return True
+
+    async def fake_release(redis, ch):
+        releases["n"] += 1
+
+    _patch_gate(monkeypatch, fake_acquire, fake_release)
+    res = asyncio.run(run_generation_task({"redis": object()}, tid))
+    db_session.expire_all()
+    final = db_session.get(Task, tid)
+    assert res["status"] == "skipped"
+    assert final.status == "failed"
+    assert "排队超时" in (final.error_msg or "")
+    assert releases["n"] == 1
+
+
+def test_successful_video_generation_releases_acquired_gate_once(
+    client, worker_db, db_session, monkeypatch
+):
+    """正常拿到闸门并完成生成：槽位释放恰好一次。"""
+    from backend.app.models import Task
+    from backend.worker import run_generation_task
+
+    t = Task(user_id=1, type="video", prompt="p", model="fake-video", status="queued")
+    db_session.add(t)
+    db_session.commit()
+    tid = int(t.id)
+    releases = {"n": 0}
+
+    async def fake_acquire(redis, ch, limit=2, **kw):
+        return True
+
+    async def fake_release(redis, ch):
+        releases["n"] += 1
+
+    _patch_gate(monkeypatch, fake_acquire, fake_release)
+    res = asyncio.run(run_generation_task({"redis": object()}, tid))
+    db_session.expire_all()
+    final = db_session.get(Task, tid)
+    assert res["status"] == "completed"
+    assert final.status == "completed"
+    assert releases["n"] == 1
+
+
+def test_gate_queue_timeout_never_releases_unacquired_gate(
+    client, worker_db, db_session, monkeypatch
+):
+    """acquire 返回 False（排队超时，槽位未持有）：释放次数为 0。"""
+    from backend.app.models import Task
+    from backend.worker import run_generation_task
+
+    t = Task(user_id=1, type="video", prompt="p", model="fake-video", status="queued")
+    db_session.add(t)
+    db_session.commit()
+    tid = int(t.id)
+    releases = {"n": 0}
+    acquires = {"n": 0}
+
+    async def fake_acquire(redis, ch, limit=2, **kw):
+        acquires["n"] += 1
+        return False
+
+    async def fake_release(redis, ch):
+        releases["n"] += 1
+
+    _patch_gate(monkeypatch, fake_acquire, fake_release)
+    res = asyncio.run(run_generation_task({"redis": object()}, tid))
+    db_session.expire_all()
+    final = db_session.get(Task, tid)
+    assert acquires["n"] == 1
+    assert res["status"] == "failed"
+    assert "渠道并发闸门" in (res.get("error") or "")
+    assert final.status == "failed"
+    assert releases["n"] == 0

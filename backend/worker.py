@@ -328,25 +328,28 @@ async def run_generation_task(
                 publish_task_event(task_id, "failed", {"error": msg})
                 return {"status": "failed", "error": msg}
             _gate_held = True
-        # 闸门后复检（review 事故修复）：闸门前排队最长 3500s，期间任务可能已被
-        # 并发写终态（取消 / 收尸）。再启动生成前直读 DB 最新状态，已终态/被改写
-        # 则直接放弃——不跑 provider、不覆盖既有终态。started_at 由 lifecycle 的
-        # mark_started 在此刻之后写入，闸门等待不计入 30 分钟生成超时。
-        from backend.app.services.task_store import ensure_claimed_task_startable
-
-        recheck = ensure_claimed_task_startable(db, task_id)
-        if recheck is not None:
-            logger.warning(
-                "task %s skipped after gate (status=%r): terminal/cancelled while "
-                "waiting at channel gate",
-                task_id, recheck,
-            )
-            return {
-                "status": "skipped",
-                "task_status": recheck or "missing",
-                "error": f"task no longer claimable after gate (status={recheck or 'missing'})",
-            }
+        # 闸门后复检与生成放在同一 try 里：复检失败的提前返回也必须走到 finally
+        # 释放已持有的槽位。acquire 返回 False 的超时路径在 try 之外返回，
+        # _gate_held 仍为 False，不会释放未持有的槽位。
         try:
+            # 闸门后复检（review 事故修复）：闸门前排队最长 3500s，期间任务可能已被
+            # 并发写终态（取消 / 收尸）。再启动生成前直读 DB 最新状态，已终态/被改写
+            # 则直接放弃——不跑 provider、不覆盖既有终态。started_at 由 lifecycle 的
+            # mark_started 在此刻之后写入，闸门等待不计入 30 分钟生成超时。
+            from backend.app.services.task_store import ensure_claimed_task_startable
+
+            recheck = ensure_claimed_task_startable(db, task_id)
+            if recheck is not None:
+                logger.warning(
+                    "task %s skipped after gate (status=%r): terminal/cancelled while "
+                    "waiting at channel gate",
+                    task_id, recheck,
+                )
+                return {
+                    "status": "skipped",
+                    "task_status": recheck or "missing",
+                    "error": f"task no longer claimable after gate (status={recheck or 'missing'})",
+                }
             _lifecycle_started = True
             result = await run_task_lifecycle(
                 db, task_id, generate_with_retry,
